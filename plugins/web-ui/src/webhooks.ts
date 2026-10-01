@@ -24,7 +24,7 @@ export interface WebhookView {
   url: string;
 }
 
-type WebhookScheme = "hmac-sha256" | "github" | "slack" | "stripe";
+type WebhookScheme = "hmac-sha256" | "github" | "slack" | "stripe" | "linear";
 
 const WEBHOOK_SCHEMES: Array<{ value: WebhookScheme; label: string; guidance: string }> = [
   {
@@ -46,6 +46,11 @@ const WEBHOOK_SCHEMES: Array<{ value: WebhookScheme; label: string; guidance: st
     value: "stripe",
     label: "Stripe",
     guidance: "Use the endpoint signing secret shown by Stripe for this destination.",
+  },
+  {
+    value: "linear",
+    label: "Linear",
+    guidance: "Use the webhook signing secret shown by Linear. Payloads older than one minute are rejected.",
   },
 ];
 
@@ -151,7 +156,6 @@ function drawWebhooksPage(): void {
         webhooksScope = s;
         drawWebhooksPage();
       },
-      onRefresh: () => void renderWebhooksPage(),
       action: { label: "New webhook", onClick: showNewWebhook },
       search: {
         value: webhooksSearch,
@@ -198,7 +202,7 @@ function copyRow(text: string) {
     <div class="copyrow">
       <code class="mono">${text}</code>
       <button class="btn" @click=${(e: Event) => void copyText(text, e.currentTarget as HTMLButtonElement)}>
-        Copy
+        <span>Copy</span>
       </button>
     </div>
   `;
@@ -207,6 +211,7 @@ function copyRow(text: string) {
 function openWebhook(w: WebhookView, opts: { push?: boolean } = {}): void {
   if (!appState.mainEl) return;
   syncWebhookUrl(w.id, opts.push);
+  const eventsHost = document.createElement("section");
   const notice = webhooksNotice || webhooksNoticeSticky;
   webhooksNotice = "";
   webhooksNoticeSticky = "";
@@ -278,6 +283,7 @@ function openWebhook(w: WebhookView, opts: { push?: boolean } = {}): void {
               </div>`
             : ""
         }
+        ${eventsHost}
         <div class="actions">
           ${
             w.enabled
@@ -290,6 +296,62 @@ function openWebhook(w: WebhookView, opts: { push?: boolean } = {}): void {
     host,
   );
   appState.mainEl.replaceChildren(host);
+  void loadWebhookEvents(w.id, eventsHost);
+}
+
+interface WebhookEventView {
+  receivedAt: number;
+  payload: string;
+  sessionId?: string;
+}
+
+async function loadWebhookEvents(id: string, host: HTMLElement): Promise<void> {
+  render(
+    html`<h3>Message history</h3>
+      <p class="hint" role="status">Loading messages…</p>`,
+    host,
+  );
+  try {
+    const { events } = await api<{ events: WebhookEventView[] }>(`/api/webhooks/${encodeURIComponent(id)}/events`);
+    if (!host.isConnected) return;
+    render(
+      html`
+        <h3>Message history</h3>
+        <p class="hint">
+          Latest 50 accepted events. Payloads show what was passed to the agent, capped at 16,000 characters. Earlier
+          events are not backfilled.
+        </p>
+        ${
+          events.length
+            ? events.map(
+                (event) => html`
+                  <details class="code-card">
+                    <summary class="tool-payload-label">
+                      <time datetime=${new Date(event.receivedAt).toISOString()}
+                        >${new Date(event.receivedAt).toLocaleString()}</time
+                      >
+                    </summary>
+                    <pre class="tool-payload-body">${event.payload}</pre>
+                    <div class="code-card-foot">
+                      ${event.sessionId ? html`<a class="btn" href=${deepLinkPath(UI_BASE, "chats", event.sessionId)}>Open session</a>` : html`<span class="hint">No session available.</span>`}
+                    </div>
+                  </details>
+                `,
+              )
+            : html`<p class="hint">No messages recorded yet.</p>`
+        }
+      `,
+      host,
+    );
+  } catch (error) {
+    if (!host.isConnected) return;
+    render(
+      html`<h3>Message history</h3>
+        <p role="alert">${errMessage(error, "Couldn't load messages.")}</p>
+        <button class="btn" @click=${() => void loadWebhookEvents(id, host)}>Retry</button>`,
+      host,
+    );
+  }
 }
 
 async function setWebhookEnabled(id: string, enabled: boolean): Promise<void> {
@@ -319,7 +381,7 @@ function webhookForm() {
       ${listBackLink("Webhooks", drawWebhooksPage)}
       <h2>New webhook</h2>
       <label
-        >Action <span class="hint">— what the agent should do for each event</span>
+        >Action <span class="hint">(what the agent should do for each event)</span>
         <textarea
           name="action"
           rows="4"
@@ -357,14 +419,14 @@ function webhookForm() {
         <span class="hint webhook-scheme-guidance">${WEBHOOK_SCHEMES[0]!.guidance}</span>
       </label>
       <label
-        >Signing secret <span class="hint">— leave blank to auto-generate</span>
+        >Signing secret <span class="hint">(leave blank to auto-generate)</span>
         <div class="copyrow">
           <input type="text" name="secret" placeholder="auto-generated if blank" />
           <button type="button" class="btn" @click=${fillGeneratedSecret}>Generate</button>
         </div>
       </label>
       <label
-        >Filters <span class="hint">— optional; one per line as <code>path: value1, value2</code></span>
+        >Filters <span class="hint">(optional; one per line as <code>path: value1, value2</code>)</span>
         <textarea name="filters" rows="2" placeholder="action: opened, reopened"></textarea>
       </label>
       <p class="hint">
@@ -472,7 +534,7 @@ function showWebhookCreated(w: WebhookView, url: string): void {
       <div class="resource-detail">
         ${listBackLink("Webhooks", drawWebhooksPage)}
         <h2>Webhook created ✓</h2>
-        <div class="warn">Copy the secret now — it won't be shown again.</div>
+        <div class="warn">Copy the secret now. It won't be shown again.</div>
         <div class="field">
           <label>Inbound URL</label>
           ${copyRow(url)}

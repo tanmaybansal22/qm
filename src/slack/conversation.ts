@@ -1,4 +1,7 @@
+import { resolveMentions } from "./mrkdwn.ts";
+export { resolveMentions } from "./mrkdwn.ts";
 import { encodeTs, summarizeReactions, type ReactionTally } from "./reactions.ts";
+import { utcMinute } from "../util/time.ts";
 import { MAX_ATTACHMENTS_PER_TURN } from "./attachments.ts";
 
 export interface ContextWireMessage {
@@ -115,16 +118,6 @@ function arrangeForDisplay(messages: readonly RecentMessage[]): Array<{ message:
   return out;
 }
 
-const SLACK_MENTION = /<@([A-Z0-9]+)(?:\|[^>]*)?>/g;
-
-export function resolveMentions(text: string, nameById: ReadonlyMap<string, string> | undefined): string {
-  if (!nameById || !text.includes("<@")) return text;
-  return text.replace(SLACK_MENTION, (m, id) => {
-    const name = nameById.get(id);
-    return name ? `@${name}` : m;
-  });
-}
-
 interface ConversationMember {
   id: string;
   name: string;
@@ -134,6 +127,7 @@ interface ConversationMember {
 }
 
 export interface ConversationView {
+  contextNote?: string;
   channel: { name?: string; kind: "dm" | "channel" | "group"; isPrivate?: boolean };
   members: readonly ConversationMember[];
   messages: readonly RecentMessage[];
@@ -174,7 +168,7 @@ const clipMessage = (t: string, max: number = MAX_RECENT_MESSAGE_CHARS): string 
 export function formatSlackTs(ts: string): string {
   const sec = Number(ts);
   if (!Number.isFinite(sec) || sec <= 0) return "";
-  return new Date(sec * 1000).toISOString().slice(0, 16).replace("T", " ") + "Z";
+  return utcMinute(sec * 1000);
 }
 
 function messageTurnText(
@@ -245,7 +239,7 @@ export function renderConversationView(view: ConversationView): RenderedConversa
     ? "Files too big to view this turn: " + view.omittedFiles.map((f) => f.name).join(", ") + "."
     : "";
 
-  const header = [fileLine, omittedLine, where, who, here].filter(Boolean).join(" ");
+  const header = [fileLine, omittedLine, where, who, here, view.contextNote].filter(Boolean).join(" ");
 
   const detectContext = msgs
     .filter((m) => !m.isBot && !m.isSelf && !m.isTrigger)

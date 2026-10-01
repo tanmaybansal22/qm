@@ -2,8 +2,11 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   activityOf,
+  cronRowMeta,
+  sidebarSessions,
   applySessionState,
   isAbandonedNewChat,
+  shouldStartProactiveOpener,
   bumpActivity,
   chatBrowseStatusMatches,
   clearWorking,
@@ -16,6 +19,7 @@ import {
   recentProjectSeeds,
   reconcileSessions,
   splitPinned,
+  watchActivityLabel,
   withPendingSession,
   withoutUnsentPending,
 } from "../src/session-list.ts";
@@ -115,6 +119,26 @@ test("reconcile drops a pending chat once the server knows its threadRef", () =>
   assert.equal(out.length, 1);
   assert.equal(out[0]!.id, "9");
   assert.equal(out[0]!.title, "Bubble waffle order");
+});
+
+test("reconcile keeps the rows of conversations still on screen when the server omits them", () => {
+  const prev = [saved("1", "web:u:x"), saved("2", "web:u:y"), saved("3", "web:u:z")];
+  const server = [saved("3", "web:u:z")];
+  assert.deepEqual(
+    reconcileSessions(server, prev, ["1", "2"]).map((s) => s.id),
+    ["1", "2", "3"],
+    "every open pane keeps its row, not just one",
+  );
+  assert.deepEqual(
+    reconcileSessions(server, prev).map((s) => s.id),
+    ["3"],
+    "a row nobody is reading still goes when the server drops it",
+  );
+  assert.deepEqual(
+    reconcileSessions([saved("9", "web:u:x")], prev, ["1"]).map((s) => s.id),
+    ["9"],
+    "a threadRef the server now answers for under a new id must not render twice",
+  );
 });
 
 test("reconcile against an empty prev is just the server list", () => {
@@ -364,22 +388,53 @@ test("rowIndicators: awaitingInput maps through", () => {
 });
 
 test("backgroundLabel: jobs, watches and crons fold into one chip with a spoken label", () => {
-  assert.deepEqual(backgroundLabel(1, 0, 0), { jobs: 1, watches: 0, crons: 0, label: "1 background job running" });
+  assert.deepEqual(backgroundLabel(1, 0, 0), {
+    jobs: 1,
+    watches: 0,
+    crons: 0,
+    subagents: 0,
+    goal: false,
+    label: "1 background job running",
+  });
   assert.deepEqual(backgroundLabel(2, 1, 0), {
     jobs: 2,
     watches: 1,
     crons: 0,
+    subagents: 0,
+    goal: false,
     label: "2 background jobs running · 1 watch armed",
   });
-  assert.deepEqual(backgroundLabel(0, 2, 0), { jobs: 0, watches: 2, crons: 0, label: "2 watches armed" });
-  assert.deepEqual(backgroundLabel(0, 0, 1), { jobs: 0, watches: 0, crons: 1, label: "1 cron scheduled here" });
+  assert.deepEqual(backgroundLabel(0, 2, 0), {
+    jobs: 0,
+    watches: 2,
+    crons: 0,
+    subagents: 0,
+    goal: false,
+    label: "2 watches armed",
+  });
+  assert.deepEqual(backgroundLabel(0, 0, 1), {
+    jobs: 0,
+    watches: 0,
+    crons: 1,
+    subagents: 0,
+    goal: false,
+    label: "1 cron scheduled here",
+  });
   assert.deepEqual(backgroundLabel(0, 1, 2), {
     jobs: 0,
     watches: 1,
     crons: 2,
+    subagents: 0,
+    goal: false,
     label: "1 watch armed · 2 crons scheduled here",
   });
   assert.equal(backgroundLabel(0, 0, 0), null, "nothing running, nothing to say");
+});
+
+test("watchActivityLabel: shows the last check as relative minutes, and omits it before the first check", () => {
+  assert.equal(watchActivityLabel({ lastFiredAt: Date.now() - 3 * 60_000 }), "still watching · last check 3m ago");
+  assert.equal(watchActivityLabel({ lastFiredAt: Date.now() - 30_000 }), "still watching · last check just now");
+  assert.equal(watchActivityLabel({}), "still watching");
 });
 
 test("rowIndicators: background counts flow through backgroundLabel — zero counts treated as absent", () => {
@@ -388,10 +443,19 @@ test("rowIndicators: background counts flow through backgroundLabel — zero cou
     jobs: 2,
     watches: 1,
     crons: 0,
+    subagents: 0,
+    goal: false,
     label: "2 background jobs running · 1 watch armed",
   });
   const cronOnly = rowIndicators({ ...saved("1", "web:u:x"), crons: 3 }, null);
-  assert.deepEqual(cronOnly.background, { jobs: 0, watches: 0, crons: 3, label: "3 crons scheduled here" });
+  assert.deepEqual(cronOnly.background, {
+    jobs: 0,
+    watches: 0,
+    crons: 3,
+    subagents: 0,
+    goal: false,
+    label: "3 crons scheduled here",
+  });
   assert.equal(
     rowIndicators({ ...saved("1", "web:u:x"), backgroundJobs: 0, watches: 0, crons: 0 }, null).background,
     null,
@@ -405,6 +469,8 @@ test("conversationBackground: resolves the mounted conversation by session id", 
     jobs: 2,
     watches: 1,
     crons: 0,
+    subagents: 0,
+    goal: false,
     label: "2 background jobs running · 1 watch armed",
   });
 });
@@ -415,6 +481,8 @@ test("conversationBackground: falls back to threadRef while the conversation is 
     jobs: 0,
     watches: 1,
     crons: 0,
+    subagents: 0,
+    goal: false,
     label: "1 watch armed",
   });
 });
@@ -465,4 +533,64 @@ test("a new chat with anything worth keeping is not abandoned", () => {
   assert.equal(isAbandonedNewChat({ ...base, sessionId: "s1" }), false, "saved session");
   assert.equal(isAbandonedNewChat({ ...base, nextThreadRef: "web:alice:t1" }), false, "remounting the same chat");
   assert.equal(isAbandonedNewChat({ ...base, threadRef: null }), false, "no chat mounted");
+});
+
+test("first personal chat opens proactively even when background suggestions already ran", () => {
+  const first = {
+    started: false,
+    sessionId: null,
+    scopeId: null,
+    messageCount: 0,
+    loaded: true,
+    sessions: [],
+  };
+  assert.equal(shouldStartProactiveOpener(first), true);
+  assert.equal(shouldStartProactiveOpener({ ...first, sessions: [saved("refresh", "cron:refresh:fire:1")] }), true);
+  assert.equal(shouldStartProactiveOpener({ ...first, sessions: [pending("web:alice:draft")] }), true);
+  for (const threadRef of ["web:alice:previous", "dm:D123:123.456", "ch:C123:123.456"]) {
+    assert.equal(shouldStartProactiveOpener({ ...first, sessions: [saved("previous", threadRef)] }), false);
+  }
+  assert.equal(shouldStartProactiveOpener({ ...first, started: true }), false);
+  assert.equal(shouldStartProactiveOpener({ ...first, loaded: false }), false);
+  assert.equal(shouldStartProactiveOpener({ ...first, sessionId: "existing" }), false);
+  assert.equal(shouldStartProactiveOpener({ ...first, scopeId: "channel:C123" }), false);
+  assert.equal(shouldStartProactiveOpener({ ...first, messageCount: 1 }), false);
+});
+
+test("sidebar excludes attached subagents including pinned and orphaned children", () => {
+  const parent = saved("parent", "web:alice:parent");
+  const child = { ...saved("child", "agent:main:subagent:child"), parentSessionId: parent.id };
+  const pinned = { ...child, id: "pinned", pinned: true };
+  const orphan = { ...child, id: "orphan", parentSessionId: "missing" };
+  const detached = saved("detached", "agent:main:subagent:detached");
+  assert.deepEqual(sidebarSessions([parent, child, pinned, orphan, detached]), [parent, detached]);
+});
+
+test("cronRowMeta shows the next fire and the last result of a session's cron", () => {
+  const now = Date.now();
+  assert.equal(cronRowMeta({ id: "c", nextFireAt: now + 10 * 60_000 + 1_000 }), "next fire in 10m");
+  assert.equal(
+    cronRowMeta({
+      id: "c",
+      nextFireAt: now + 5 * 60_000 + 1_000,
+      lastFire: { firedAt: now - 3 * 60_000, status: "ok" },
+    }),
+    "next fire in 5m · last ok 3m ago",
+  );
+  assert.equal(cronRowMeta({ id: "c", lastFire: { firedAt: now - 1_000, status: "running" } }), "paused · running now");
+});
+
+test("a goal lights the background chip with time worked, then the floor", () => {
+  const row = backgroundLabel(
+    0,
+    0,
+    0,
+    0,
+    0,
+    { activeMs: 600_000, runningSince: 600_000, floor: { minMs: 1_200_000 } },
+    720_000,
+  );
+  assert.equal(row?.goal, true);
+  assert.equal(row?.label, "goal · 12m worked · 20m floor");
+  assert.equal(backgroundLabel(0, 0, 0, 0, 0, { activeMs: 60_000 }, 9_999_999)?.label, "goal · 1m worked");
 });

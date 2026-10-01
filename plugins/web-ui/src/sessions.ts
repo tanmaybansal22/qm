@@ -1,3 +1,5 @@
+import { sessionStatusMark } from "./session-status.ts";
+import { openSessionShare } from "./session-share";
 import { html, nothing, render, type TemplateResult } from "lit";
 import { live } from "lit/directives/live.js";
 import { ref } from "lit/directives/ref.js";
@@ -6,11 +8,14 @@ import {
   Archive,
   Ban,
   Binoculars,
+  Bot,
+  Target,
   ArchiveRestore,
   ChevronDown,
   ChevronRight,
   Clock3,
   Cog,
+  CornerLeftUp,
   EllipsisVertical,
   Folder,
   Hash,
@@ -23,15 +28,17 @@ import {
   Plus,
   RefreshCw,
   SquareTerminal,
-  User,
   Users,
   X,
+  type IconNode,
 } from "lucide";
 import {
   api,
   attachPendingApprovals,
+  fetchSessionApprovals,
   fetchTranscript,
   currentEarlierCount,
+  detachSession,
   inheritedTranscript,
   isContinuable,
   entriesToMessages,
@@ -50,6 +57,7 @@ import {
   activityOf,
   chatBrowseStatusMatches,
   bumpActivity,
+  sidebarSessions,
   groupProjectSessions,
   recencyGroup,
   recentProjectSeeds,
@@ -61,9 +69,9 @@ import {
   type RecentItem,
   type ChatBrowseStatus,
 } from "./session-list";
-import { hideTooltip, showTooltip } from "./tooltip";
+import { tip } from "./tooltip";
 import { errMessage } from "../../chassis/src/errors";
-import { copyText, fieldSelect, icon, relTime } from "./ui";
+import { copyText, icon, menuSelect, relTime, workingWave } from "./ui";
 import { listPageTpl } from "./list-page";
 import {
   contextsState,
@@ -75,25 +83,20 @@ import {
 } from "./contexts";
 import { groupDmLabel, groupDmText } from "./group-dm-label";
 import { transcriptModel } from "./model-options";
-import {
-  appState,
-  closeSidebarOnNarrowView,
-  renderSidebarTop,
-  showMainEmpty,
-  syncDocumentTitle,
-  syncUrlFromState,
-} from "./shell";
-import { allConversations, mainConversation } from "./conversations";
+import { appState, closeSidebarOnNarrowView, renderSidebarTop, syncDocumentTitle, syncUrlFromState } from "./shell";
+import { allConversations, isLiveConversation, mainConversation } from "./conversations";
 import type { Conversation } from "./conv-types";
 import {
-  beginSessionDrag,
-  endSessionDrag,
-  notifySessionsChanged,
-  closeSessionSurfaces,
-  openBackgroundInCanvas,
-  openBlankInFocusedPane,
+  startNewChatInCanvas,
   mountRestoredCanvas,
+  focusedPaneConversation,
+  openBackgroundInCanvas,
+  beginSessionDrag,
+  endPaneDrag,
+  canvasToast,
+  notifyPanesChanged,
   drawCanvas,
+  closeSessionSurfaces,
   sessionInCanvas,
   splitInterceptsOpen,
   splitState,
@@ -163,6 +166,10 @@ const RECENT_CONTEXT_MAX_AGE_MS = 30_000;
 let renameDraft = "";
 const refreshingTitleIds = new Set<string>();
 let showArchived = false;
+const SESSION_BATCH_SIZE = 50;
+let recentLimit = SESSION_BATCH_SIZE;
+let archivedLimit = SESSION_BATCH_SIZE;
+let chatsPageLimit = SESSION_BATCH_SIZE;
 
 let chatsPageScope: string | null = null;
 let chatsPageQuery = "";
@@ -179,6 +186,10 @@ export function resetSessionsState(): void {
   sessionPatchVersions.clear();
   sessionsState.list = [];
   sessionsState.loaded = false;
+  listRequestedAt = 0;
+  sessionsRefreshRunning = false;
+  queuedSessionsRefresh = null;
+  sessionRefreshSeq++;
   sessionsState.openMenuId = null;
   sessionsState.renamingId = null;
   sessionsState.openingKey = null;
@@ -186,6 +197,9 @@ export function resetSessionsState(): void {
   renameDraft = "";
   refreshingTitleIds.clear();
   showArchived = false;
+  recentLimit = SESSION_BATCH_SIZE;
+  archivedLimit = SESSION_BATCH_SIZE;
+  chatsPageLimit = SESSION_BATCH_SIZE;
   chatsPageScope = null;
   chatsPageQuery = "";
   chatsPageStatus = "active";
@@ -231,6 +245,7 @@ function listWhen(ms: number): string {
 export function surfaceOf(s: CoreSession): string {
   if (s.threadRef.startsWith("web:")) return "web";
   if (s.threadRef.startsWith("dm:") || s.threadRef.startsWith("ch:")) return "slack";
+  if (s.threadRef.startsWith("agent:main:subagent:") && s.surface) return s.surface;
   return "core";
 }
 
@@ -270,7 +285,7 @@ export function groupDmTitle(s: CoreSession): TemplateResult | string {
   if (s.type !== "group") return defaultSessionTitle(s);
   const label = groupDmLabel(s.channelName);
   if (!label) return defaultSessionTitle(s);
-  return html`<span class="group-dm-title" title=${label.text}>
+  return html`<span class="group-dm-title" ${tip(label.text)}>
     <span class="group-dm-count">${label.count}</span>
     <span class="group-dm-names">${label.text}</span>
   </span>`;
@@ -306,49 +321,106 @@ export function slackLogo(size = 13): TemplateResult {
 }
 
 function visibleSessions(): CoreSession[] {
-  const sorted = [...sessionsState.list].sort((a, b) => activityOf(b) - activityOf(a));
+  const sorted = sidebarSessions(sessionsState.list).sort((a, b) => activityOf(b) - activityOf(a));
   return sessionsState.webOnly ? sorted.filter((s) => surfaceOf(s) === "web") : sorted;
 }
 
 export function renderList(): void {
   syncDocumentTitle();
+  if (chatsPageShowing()) drawChatsPage();
   if (!appState.listEl) return;
   const visible = visibleSessions();
   const active = visible.filter((s) => !s.archived);
   const archived = visible.filter((s) => s.archived);
   const { pinned, rest } = splitPinned(active);
+  const keptIds = new Set([
+    ...openConversationIds(),
+    ...selection.ids,
+    selection.anchor,
+    sessionsState.openMenuId,
+    sessionsState.renamingId,
+  ]);
+  const shownThreads = new Set(
+    [
+      ...rest.slice(0, recentLimit),
+      ...archived.slice(0, archivedLimit),
+      ...visible.filter((session) => !session.id || keptIds.has(session.id)),
+    ].map((session) => session.threadRef),
+  );
   const activeItems = recentItemsFor(rest);
-  const archivedItems: RecentItem[] = archived.map((session) => ({ kind: "session", session }));
+  const archivedItems: RecentItem[] = archived.map((session) => ({
+    kind: "session",
+    session,
+  }));
   armMidnightRefresh();
   render(
     html`
+      ${detachDropZone()}
       ${
         pinned.length
           ? html`
-              <div class="recents-group pinned-head">${icon(Pin, 11)}<span>Pinned</span></div>
-              ${repeat(
-                pinned,
-                (session) => session.threadRef,
-                (session) => sessionRow(session),
-              )}
+              <div class="recents-group pinned-head">
+                <span class="pinned-head-glyph">${icon(Pin, 11)}</span><span>Pinned</span>
+              </div>
+              <div class="pinned-children">
+                ${repeat(
+                  pinned,
+                  (session) => session.threadRef,
+                  (session) => sessionRow(session),
+                )}
+              </div>
             `
           : nothing
       }
-      ${groupedRows(activeItems)}
+      ${groupedRows(activeItems, shownThreads)}
+      ${
+        rest.some((session) => !shownThreads.has(session.threadRef))
+          ? html`<button
+              class="archived-toggle"
+              type="button"
+              @click=${() => {
+                recentLimit += SESSION_BATCH_SIZE;
+                renderList();
+              }}
+            >
+              Show more conversations
+            </button>`
+          : nothing
+      }
       ${
         archived.length
           ? html`
               <button class="archived-toggle ${showArchived ? "open" : ""}" @click=${toggleShowArchived}>
-                ${icon(showArchived ? ChevronDown : ChevronRight, 14)} ${icon(Archive, 14)}
+                ${icon(showArchived ? ChevronDown : ChevronRight, 14)}
                 <span>Archived</span>
                 <span class="archived-count">${archived.length}</span>
               </button>
-              ${showArchived ? groupedRows(archivedItems) : nothing}
+              ${
+                showArchived
+                  ? html`<div class="archived-children">
+                      ${groupedRows(archivedItems, shownThreads)}
+                      ${
+                        archived.some((session) => !shownThreads.has(session.threadRef))
+                          ? html`<button
+                              class="archived-toggle"
+                              type="button"
+                              @click=${() => {
+                                archivedLimit += SESSION_BATCH_SIZE;
+                                renderList();
+                              }}
+                            >
+                              Show more archived conversations
+                            </button>`
+                          : nothing
+                      }
+                    </div>`
+                  : nothing
+              }
             `
           : nothing
       }
       ${sessionsNotice ? html`<div class="empty" style="padding:16px">${sessionsNotice}</div>` : ""}
-      ${sessionsLoading && visible.length === 0 ? html`<div class="empty" style="padding:16px">Loading conversations...</div>` : ""}
+      ${sessionsLoading ? html`<div class="empty" style="padding:16px">Loading conversations...</div>` : ""}
       ${
         !sessionsLoading && !sessionsNotice && visible.length === 0
           ? html`<div class="empty" style="padding:16px">
@@ -365,14 +437,22 @@ export function renderList(): void {
   if (sessionsState.openMenuId) {
     requestAnimationFrame(() => placeSessionMenu(appState.listEl?.querySelector(".session-menu-popover") ?? undefined));
   }
-  notifySessionsChanged();
+  notifyPanesChanged();
 }
 
-function recentItem(item: RecentItem): TemplateResult {
+const NEW_CHAT_TOOLTIP = "Start a new chat";
+const PROJECT_OPTIONS_TOOLTIP = "Project options";
+const CHAT_OPTIONS_TOOLTIP = "Chat options";
+
+function newChatHint(name: string): string {
+  return `Start a new chat in ${name}`;
+}
+
+function recentItem(item: RecentItem, shownThreads: ReadonlySet<string>): TemplateResult {
   if (item.kind === "session") return sessionRow(item.session);
   const collapsed = sessionsState.collapsedProjectScopes.has(item.scopeId);
-  let glyph = Folder;
-  if (item.groupKind === "personal") glyph = User;
+  let glyph: IconNode | null = Folder;
+  if (item.groupKind === "personal") glyph = null;
   else if (item.groupKind === "channel") glyph = Hash;
   else if (item.groupKind === "group") glyph = Users;
   let fallbackName = "Project";
@@ -395,8 +475,11 @@ function recentItem(item: RecentItem): TemplateResult {
                 aria-controls=${childrenId}
                 @click=${() => toggleRecentProject(item.scopeId)}
               >
-                ${icon(collapsed ? ChevronRight : ChevronDown, 13)} ${icon(glyph, 14)}
-                <span class="recent-project-name">${name.replace(/^#/, "")}</span>
+                <span class="recent-project-glyph">
+                  ${glyph && !collapsed ? html`<span class="glyph">${icon(glyph, 14)}</span>` : nothing}
+                  <span class="chev">${icon(collapsed ? ChevronRight : ChevronDown, 13)}</span>
+                </span>
+                <span class="recent-project-name" dir="auto">${name.replace(/^#/, "")}</span>
               </button>
               <div class="session-menu recent-project-menu ${menuOpen ? "menu-open" : ""}">
                 <span class="recent-project-count">${item.sessions.length}</span>
@@ -404,33 +487,37 @@ function recentItem(item: RecentItem): TemplateResult {
                   class="session-menu-btn"
                   data-menu-id=${menuKey}
                   type="button"
-                  title="Project options"
                   aria-label=${`Options for ${name}`}
                   aria-haspopup="menu"
                   aria-expanded=${menuOpen ? "true" : "false"}
+                  ${tip(PROJECT_OPTIONS_TOOLTIP)}
                   @click=${(e: Event) => toggleSessionMenu(e, menuKey)}
                 >
-                  ${icon(EllipsisVertical, 17)}
+                  ${icon(EllipsisVertical, 15)}
                 </button>
                 ${menuOpen ? projectMenuPopover(item) : nothing}
               </div>
               <button
                 class="recent-project-new-chat"
                 type="button"
-                aria-label=${`New chat in ${name}`}
-                title=${`New chat in ${name}`}
+                aria-label=${newChatHint(name)}
+                ${tip(NEW_CHAT_TOOLTIP)}
                 @click=${(event: Event) => startProjectChat(event, item.scopeId, item.name)}
               >
-                ${icon(Plus, 14)}
+                ${icon(Plus, 15)}
               </button>
             </div>`
       }
       <div class="recent-project-children" id=${childrenId} ?hidden=${collapsed}>
-        ${repeat(
-          item.sessions,
-          (session) => session.threadRef,
-          (session) => sessionRow(session, true),
-        )}
+        ${
+          collapsed
+            ? nothing
+            : repeat(
+                item.sessions.filter((session) => shownThreads.has(session.threadRef)),
+                (session) => session.threadRef,
+                (session) => sessionRow(session, true),
+              )
+        }
       </div>
     </section>
   `;
@@ -442,12 +529,30 @@ function toggleRecentProject(scopeId: string): void {
   renderList();
 }
 
-function startProjectChat(event: Event, scopeId: string, _name: string | null): void {
-  event.stopPropagation();
+export function startNewChat(
+  scopeId: string | null = null,
+  name: string | null = null,
+  threadRef?: string,
+): Conversation | null {
   closeSidebarOnNarrowView();
-  sessionsState.collapsedProjectScopes.delete(scopeId);
-  openBlankInFocusedPane(scopeId);
-  renderList();
+  if (scopeId) sessionsState.collapsedProjectScopes.delete(scopeId);
+  const pane = startNewChatInCanvas(scopeId ?? undefined, threadRef);
+  if (pane) return pane;
+  const conv = mainConversation();
+  if (threadRef) conv.mountContinuable(threadRef, null, scopeId, [], name);
+  else addPendingSession(conv.newChat(scopeId ? { scopeId, name } : undefined), scopeId, name);
+  return conv;
+}
+
+export function startNewChatInLastScope(): void {
+  const mounted = (focusedPaneConversation() ?? mainConversation()).state;
+  const scopeId = mounted.scopeId ?? visibleSessions().find((s) => !s.archived)?.scopeId ?? null;
+  startNewChat(scopeId, scopeId ? projectName(scopeId) : null);
+}
+
+function startProjectChat(event: Event, scopeId: string, name: string | null): void {
+  event.stopPropagation();
+  startNewChat(scopeId, name);
 }
 
 function projectMenuPopover(item: Extract<RecentItem, { kind: "project" }>): TemplateResult {
@@ -510,6 +615,10 @@ export async function renderChatsPage(): Promise<void> {
   if (appState.currentView === "chats") drawChatsPage();
 }
 
+function chatsPageShowing(): boolean {
+  return Boolean(chatsPageHost && appState.mainEl && chatsPageHost.parentElement === appState.mainEl);
+}
+
 export function drawChatsPage(): void {
   if (appState.currentView !== "chats" || !appState.mainEl || splitState.active) return;
   mainConversation().state.host = null;
@@ -519,14 +628,29 @@ export function drawChatsPage(): void {
     appState.mainEl.replaceChildren(chatsPageHost);
   }
   const q = chatsPageQuery.trim().toLowerCase();
-  const rows = [...sessionsState.list]
+  const matches = sidebarSessions(sessionsState.list)
     .filter((s) => chatBrowseStatusMatches(s, chatsPageStatus))
     .filter((s) => chatsPageSurface === "all" || surfaceOf(s) === chatsPageSurface)
     .filter((s) => (chatsPageScope ? s.scopeId === chatsPageScope : true))
     .filter((s) => !q || chatMatches(s, q))
-    .sort((a, b) => activityOf(b) - activityOf(a))
-    .map((s) => chatPageRow(s));
-  let empty = "No conversations yet — start a new chat.";
+    .sort((a, b) => activityOf(b) - activityOf(a));
+  const rows = matches.slice(0, chatsPageLimit).map((s) => chatPageRow(s));
+  if (matches.length > chatsPageLimit)
+    rows.push(
+      html`<div class="list-footer">
+        <button
+          class="btn"
+          type="button"
+          @click=${() => {
+            chatsPageLimit += SESSION_BATCH_SIZE;
+            drawChatsPage();
+          }}
+        >
+          Show more conversations
+        </button>
+      </div>`,
+    );
+  let empty = "No conversations yet. Start a new chat.";
   if (sessionsLoading && sessionsState.list.length === 0) empty = "Loading conversations…";
   else if (chatsPageScope || q || chatsPageStatus !== "active" || chatsPageSurface !== "all") {
     empty = "No conversations match.";
@@ -537,15 +661,16 @@ export function drawChatsPage(): void {
       scope: chatsPageScope,
       onScope: (s) => {
         chatsPageScope = s;
+        chatsPageLimit = SESSION_BATCH_SIZE;
         drawChatsPage();
       },
-      onRefresh: () => void renderChatsPage(),
-      action: { label: "New chat", onClick: () => mainConversation().newChat() },
+      action: { label: "New chat", onClick: () => startNewChat() },
       search: {
         value: chatsPageQuery,
         placeholder: "Search chats…",
         onInput: (v) => {
           chatsPageQuery = v;
+          chatsPageLimit = SESSION_BATCH_SIZE;
           drawChatsPage();
         },
       },
@@ -566,30 +691,32 @@ export function drawChatsPage(): void {
                 class=${chatsPageStatus === value ? "active" : ""}
                 @click=${() => {
                   chatsPageStatus = value;
+                  chatsPageLimit = SESSION_BATCH_SIZE;
                   drawChatsPage();
                 }}
               >
                 ${label}<span
-                  >${sessionsState.list.filter((session) => chatBrowseStatusMatches(session, value)).length}</span
+                  >${sidebarSessions(sessionsState.list).filter((session) => chatBrowseStatusMatches(session, value)).length}</span
                 >
               </button>`,
           )}
         </div>
-        <label class="list-select"
-          ><span>Surface</span>${fieldSelect({
-            compact: true,
+        <div class="list-select">
+          ${menuSelect({
             value: chatsPageSurface,
-            onChange: (value) => {
-              chatsPageSurface = value as typeof chatsPageSurface;
+            ariaLabel: "Filter by surface",
+            onSelect: (value) => {
+              chatsPageSurface = (value ?? "all") as typeof chatsPageSurface;
+              chatsPageLimit = SESSION_BATCH_SIZE;
               drawChatsPage();
             },
             options: [
-              html`<option value="all">All surfaces</option>`,
-              html`<option value="web">Web</option>`,
-              html`<option value="slack">Slack</option>`,
+              { value: "all", label: "All surfaces" },
+              { value: "web", label: "Web" },
+              { value: "slack", label: "Slack" },
             ],
-          })}</label
-        >
+          })}
+        </div>
       </div>`,
       rows,
       empty,
@@ -604,11 +731,12 @@ function chatMatches(s: CoreSession, q: string): boolean {
 }
 
 export const syncWorkingPulse = (el?: Element): void => {
-  if (!(el instanceof HTMLElement)) return;
+  if (!(el instanceof Element)) return;
+  const running = (): Animation[] => el.getAnimations({ subtree: true });
   const pin = (): void => {
-    for (const a of el.getAnimations()) a.startTime = 0;
+    for (const a of running()) a.startTime = 0;
   };
-  if (el.getAnimations().length > 0) pin();
+  if (running().length > 0) pin();
   else requestAnimationFrame(pin);
 };
 
@@ -630,28 +758,22 @@ function sessionWorking(s: CoreSession): boolean {
 }
 
 function statusMarks(s: CoreSession): TemplateResult {
-  const ind = rowIndicators(s, liveThreads());
-  return html`${ind.working ? html`<span class="working-dot" ${ref(syncWorkingPulse)} title="Agent is working" aria-label="Agent is working"></span>` : nothing}${
-    ind.awaiting
-      ? html`<span class="awaiting-dot" title="Waiting for your reply" aria-label="Waiting for your reply"></span>`
-      : nothing
+  const ind = rowIndicators(s, liveThreads(), sessionsState.list);
+  return html`${ind.working ? html`<span class="working-mark" ${ref(syncWorkingPulse)}>${workingWave()}</span>` : nothing}${
+    ind.awaiting ? html`<span class="awaiting-dot" aria-label="Waiting for your reply"></span>` : nothing
   }${
     ind.background
       ? html`<span
           class="bg-chip"
           role="button"
           tabindex="0"
-          aria-label="${ind.background.label} — click to inspect"
-          @mouseenter=${(e: Event) =>
-            showTooltip(e.currentTarget as Element, `${ind.background!.label} — click to inspect`)}
-          @mouseleave=${(e: Event) => hideTooltip(e.currentTarget as Element)}
-          @focus=${(e: Event) => showTooltip(e.currentTarget as Element, `${ind.background!.label} — click to inspect`)}
-          @blur=${(e: Event) => hideTooltip(e.currentTarget as Element)}
+          aria-label="${ind.background.label}. Click to inspect"
+          ${tip(`${ind.background.label}. Click to inspect`)}
           @click=${(e: Event) => openBackgroundInspector(e, s)}
           @keydown=${(e: KeyboardEvent) => (e.key === "Enter" || e.key === " ") && openBackgroundInspector(e, s)}
           >${ind.background.jobs > 0 ? icon(Cog, 11) : nothing}${
             ind.background.watches > 0 ? icon(Binoculars, 11) : nothing
-          }${ind.background.crons > 0 ? icon(Clock3, 11) : nothing}</span
+          }${ind.background.crons > 0 ? icon(Clock3, 11) : nothing}${ind.background.subagents > 0 ? icon(Bot, 11) : nothing}${ind.background.goal ? icon(Target, 11) : nothing}</span
         >`
       : nothing
   }`;
@@ -660,7 +782,9 @@ function statusMarks(s: CoreSession): TemplateResult {
 function openBackgroundInspector(e: Event, s: CoreSession): void {
   e.stopPropagation();
   e.preventDefault();
-  if (!openBackgroundInCanvas(s)) void openSession(s);
+  if (openBackgroundInCanvas(s)) return;
+  mainConversation().requestBackgroundPanel(s.id || null, s.threadRef);
+  void openSession(s);
 }
 
 function isActiveRow(s: CoreSession): boolean {
@@ -671,13 +795,10 @@ function isActiveRow(s: CoreSession): boolean {
 }
 
 function chatPageRow(s: CoreSession): TemplateResult {
-  const active = isActiveRow(s);
   const readOnly = !isContinuable(s, appState.me?.user ?? "");
+  const color = displaySessionColor(s.color);
   return html`
-    <div
-      class="list-row chat-row ${active ? "active" : ""} ${s.color ? "colored" : ""}"
-      style=${s.color ? `--session-color:${s.color}` : nothing}
-    >
+    <div class="list-row chat-row ${color ? "colored" : ""}" style=${color ? `--session-color:${color}` : nothing}>
       <a
         class="chat-row-open"
         href=${deepLinkPath(UI_BASE, "chats", s.id)}
@@ -687,12 +808,13 @@ function chatPageRow(s: CoreSession): TemplateResult {
           void openSession(s);
         }}
       >
-        <span class="list-row-title">${statusMarks(s)}${groupDmTitle(s)}</span>
+        <span class="list-row-title">${statusMarks(s)}<span dir="auto">${groupDmTitle(s)}</span></span>
         <span class="list-row-meta">
-          ${scopeChip(s.scopeId, s.channelName ?? null)}
+          ${sessionStatusMark(s.status)} ${scopeChip(s.scopeId, s.channelName ?? null)}
           ${surfaceOf(s) === "slack" ? html`<span class="surface surface-slack">${slackLogo(13)}</span>` : nothing}
-          ${readOnly ? html`<span class="ro-lock" title="Read-only">${icon(Lock, 12)}</span>` : nothing}
+          ${readOnly ? html`<span class="ro-lock" ${tip("Read-only")}>${icon(Lock, 12)}</span>` : nothing}
           <span class="list-row-date">${listWhen(activityOf(s))}</span>
+          <span class="chat-row-arrow" aria-hidden="true">${icon(ChevronRight, 16)}</span>
         </span>
       </a>
       ${
@@ -701,35 +823,35 @@ function chatPageRow(s: CoreSession): TemplateResult {
               <button
                 class="icon-btn"
                 type="button"
-                title="Copy link"
-                aria-label=${`Copy link to ${sessionTitle(s)}`}
-                @click=${() => void copyText(sessionLink(location.origin, UI_BASE, s.id))}
-              >
-                ${icon(Link, 14)}
-              </button>
-              <button
-                class="icon-btn"
-                type="button"
-                title=${s.pinned ? "Unpin" : "Pin"}
+                ${tip(s.pinned ? "Unpin" : "Pin")}
                 aria-label=${`${s.pinned ? "Unpin" : "Pin"} ${sessionTitle(s)}`}
                 @click=${() => {
                   setPinned(s, !s.pinned);
                   drawChatsPage();
                 }}
               >
-                ${s.pinned ? icon(PinOff, 14) : icon(Pin, 14)}
+                ${s.pinned ? icon(PinOff, 13.5) : icon(Pin, 13.5)}
               </button>
               <button
                 class="icon-btn"
                 type="button"
-                title=${s.archived ? "Unarchive" : "Archive"}
+                ${tip("Share conversation")}
+                aria-label=${`Share ${sessionTitle(s)}`}
+                @click=${() => void openSessionShare(s.id)}
+              >
+                ${icon(Link, 13.5)}
+              </button>
+              <button
+                class="icon-btn"
+                type="button"
+                ${tip(s.archived ? "Unarchive" : "Archive")}
                 aria-label=${`${s.archived ? "Unarchive" : "Archive"} ${sessionTitle(s)}`}
                 @click=${() => {
                   setArchived(s, !s.archived);
                   drawChatsPage();
                 }}
               >
-                ${s.archived ? icon(ArchiveRestore, 14) : icon(Archive, 14)}
+                ${s.archived ? icon(ArchiveRestore, 13.5) : icon(Archive, 13.5)}
               </button>
             </span>`
           : nothing
@@ -767,19 +889,28 @@ export function bumpSessionActivity(threadRef: string): void {
   renderList();
 }
 
-function groupedRows(list: RecentItem[]): TemplateResult {
+function groupedRows(list: RecentItem[], shownThreads: ReadonlySet<string>): TemplateResult {
   const now = Date.now();
   const items: { key: string; tpl: TemplateResult }[] = [];
   let group: string | null = null;
   for (const item of list) {
+    const key = item.kind === "session" ? item.session.threadRef : projectMenuKey(item.scopeId);
+    if (
+      item.kind === "session"
+        ? !shownThreads.has(item.session.threadRef)
+        : item.sessions.length > 0 &&
+          sessionsState.openMenuId !== key &&
+          sessionsState.renamingId !== key &&
+          !item.sessions.some((session) => shownThreads.has(session.threadRef))
+    )
+      continue;
     const dateless = item.kind === "project" && item.sessions.length === 0;
     const g = recencyGroup(recentItemActivity(item), now);
     if (!dateless && g !== group) {
       group = g;
       items.push({ key: `group:${g}`, tpl: html`<div class="recents-group">${g}</div>` });
     }
-    const key = item.kind === "session" ? item.session.threadRef : `project:${item.scopeId}`;
-    items.push({ key, tpl: recentItem(item) });
+    items.push({ key, tpl: recentItem(item, shownThreads) });
   }
   return html`${repeat(
     items,
@@ -828,6 +959,7 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
   const surface = surfaceOf(s);
   const context = projectChild ? null : rowContext(s);
   const working = sessionWorking(s);
+  const color = displaySessionColor(s.color);
   let titleContent: string | TemplateResult = groupDmTitle(s);
   if (refreshingTitle) {
     titleContent = html`<span class="sheen-label title-sheen thinking-sheen" data-sheen=${title}>${title}</span>`;
@@ -850,8 +982,8 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
   return html`
     <div
       data-session-id=${saved ? s.id : nothing}
-      class="session-row ${active ? "active" : ""} ${saved && selection.ids.has(s.id) ? "selected" : ""} ${menuOpen ? "menu-open" : ""} ${readOnly ? "read-only" : ""} ${refreshingTitle ? "title-refreshing" : ""} ${working ? "working" : ""} ${s.awaitingInput ? "awaiting-input" : ""} ${projectChild ? "project-child" : ""} ${s.color ? "colored" : ""}"
-      style=${s.color ? `--session-color:${s.color}` : nothing}
+      class="session-row ${active ? "active" : ""} ${saved && selection.ids.has(s.id) ? "selected" : ""} ${menuOpen ? "menu-open" : ""} ${readOnly ? "read-only" : ""} ${refreshingTitle ? "title-refreshing" : ""} ${working ? "working" : ""} ${s.awaitingInput ? "awaiting-input" : ""} ${projectChild ? "project-child" : ""} ${color ? "colored" : ""}"
+      style=${color ? `--session-color:${color}` : nothing}
     >
       <a
         class="session"
@@ -859,7 +991,6 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
         aria-busy=${refreshingTitle ? "true" : "false"}
         aria-label=${ariaLabel}
         aria-keyshortcuts="Space Shift+Space Control+Space Meta+Space"
-        title="Press Space to select"
         draggable=${saved ? "true" : "false"}
         @dragstart=${(e: DragEvent) => onSessionDragStart(e, s)}
         @dragend=${() => endSessionDrag()}
@@ -900,39 +1031,53 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
         }}
       >
         <div class="title" aria-live="polite">
-          ${statusMarks(s)}${surfaceGlyph(s)}${readOnly ? html`<span class="ro-lock" title="Read-only">${icon(Lock, 12)}</span>` : nothing}<span
+          ${statusMarks(s)}${surfaceGlyph(s)}${readOnly ? html`<span class="ro-lock" ${tip("Read-only")}>${icon(Lock, 12)}</span>` : nothing}<span
             class="tl"
+            dir="auto"
             >${titleContent}</span
-          >${context ? html`<span class="row-context" title=${context}>${context}</span>` : nothing}
+          >${context ? html`<span class="row-context" ${tip(context)}>${context}</span>` : nothing}
         </div>
       </a>
       ${
         saved
           ? html`<div class="session-menu">
               <button
+                class="session-menu-btn session-share-btn"
+                type="button"
+                ${tip("Share conversation")}
+                aria-label=${`Share ${sessionTitle(s)}`}
+                @click=${(e: Event) => {
+                  e.stopPropagation();
+                  void openSessionShare(s.id);
+                }}
+              >
+                ${icon(Link, 13.5)}
+              </button>
+              <button
                 class="session-menu-btn session-archive-btn"
                 type="button"
-                title=${s.archived ? "Unarchive" : "Archive"}
+                ${tip(s.archived ? "Unarchive" : "Archive")}
                 aria-label=${`${s.archived ? "Unarchive" : "Archive"} ${sessionTitle(s)}`}
                 @click=${(e: Event) => {
                   e.stopPropagation();
                   setArchived(s, !s.archived);
                 }}
               >
-                ${s.archived ? icon(ArchiveRestore, 15) : icon(Archive, 15)}
+                ${s.archived ? icon(ArchiveRestore, 13.5) : icon(Archive, 13.5)}
               </button>
               <button
                 class="session-menu-btn"
                 data-menu-id=${s.id}
                 type="button"
-                title="Conversation options"
+                ${tip(CHAT_OPTIONS_TOOLTIP)}
+                aria-label=${`Options for ${sessionTitle(s)}`}
                 aria-haspopup="menu"
                 aria-expanded=${menuOpen ? "true" : "false"}
                 @click=${(e: Event) => toggleSessionMenu(e, s.id)}
               >
-                ${icon(EllipsisVertical, 17)}
+                ${icon(EllipsisVertical, 15)}
               </button>
-              ${menuOpen ? sessionMenuPopover(s) : nothing}
+              ${sessionStatusMark(s.status)} ${menuOpen ? sessionMenuPopover(s) : nothing}
             </div>`
           : nothing
       }
@@ -940,14 +1085,64 @@ function sessionRow(s: CoreSession, projectChild = false): TemplateResult {
   `;
 }
 
-function onSessionDragStart(e: DragEvent, s: CoreSession): void {
+let draggingChildId: string | null = null;
+
+export function onSessionDragStart(e: DragEvent, s: CoreSession): void {
   if (!s.id) {
     e.preventDefault();
     return;
   }
   e.dataTransfer?.setData("application/x-webui-session", s.id);
   if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
-  beginSessionDrag(s);
+  draggingChildId = s.parentSessionId ? s.id : null;
+  appState.listEl?.classList.toggle("detach-drop-target", Boolean(draggingChildId));
+  if (!draggingChildId) beginSessionDrag(s);
+}
+
+export function endSessionDrag(): void {
+  draggingChildId = null;
+  appState.listEl?.classList.remove("detach-drop-target");
+  appState.listEl?.querySelector(".detach-drop-zone")?.classList.remove("over");
+  endPaneDrag();
+}
+
+async function promoteSession(id: string): Promise<void> {
+  sessionsState.openMenuId = null;
+  endSessionDrag();
+  try {
+    await detachSession(id);
+    await refreshSessions({ silent: true });
+  } catch (error) {
+    canvasToast(errMessage(error));
+    renderList();
+  }
+}
+
+function detachDropZone(): TemplateResult {
+  return html`<div
+    class="detach-drop-zone"
+    @dragenter=${(e: DragEvent) => {
+      if (!draggingChildId) return;
+      e.preventDefault();
+      (e.currentTarget as HTMLElement).classList.add("over");
+    }}
+    @dragover=${(e: DragEvent) => {
+      if (!draggingChildId) return;
+      e.preventDefault();
+      if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    }}
+    @dragleave=${(e: DragEvent) => (e.currentTarget as HTMLElement).classList.remove("over")}
+    @drop=${(e: DragEvent) => {
+      const id = draggingChildId;
+      (e.currentTarget as HTMLElement).classList.remove("over");
+      if (!id) return;
+      e.preventDefault();
+      endSessionDrag();
+      void promoteSession(id);
+    }}
+  >
+    ${icon(CornerLeftUp, 13)}<span>Drop to make a top-level session</span>
+  </div>`;
 }
 
 const placeSessionMenu = (el?: Element): void => {
@@ -996,10 +1191,24 @@ function sessionMenuPopover(s: CoreSession): TemplateResult {
   `;
 }
 
-const SESSION_COLORS = ["#ef4444", "#f59e0b", "#22c55e", "#3b82f6", "#a855f7", "#ec4899"] as const;
+const SESSION_COLORS = ["#f43f5e", "#f59e0b", "#10b981", "#3b82f6", "#8b5cf6", "#ec4899"] as const;
+const LEGACY_SESSION_COLORS = new Map([
+  ["#ef4444", SESSION_COLORS[0]],
+  ["#f59e0b", SESSION_COLORS[1]],
+  ["#22c55e", SESSION_COLORS[2]],
+  ["#3b82f6", SESSION_COLORS[3]],
+  ["#a855f7", SESSION_COLORS[4]],
+  ["#ec4899", SESSION_COLORS[5]],
+]);
+
+function displaySessionColor(color: string | null | undefined): string | null {
+  if (!color) return null;
+  const normalized = color.toLowerCase();
+  return LEGACY_SESSION_COLORS.get(normalized) ?? normalized;
+}
 
 function sessionColorRow(s: CoreSession): TemplateResult {
-  const current = s.color?.toLowerCase() ?? null;
+  const current = displaySessionColor(s.color);
   const isPreset = SESSION_COLORS.includes(current as (typeof SESSION_COLORS)[number]);
   return html`
     <div class="session-menu-colors" role="group" aria-label="Row color">
@@ -1009,18 +1218,17 @@ function sessionColorRow(s: CoreSession): TemplateResult {
             class="color-swatch ${current === c ? "selected" : ""}"
             type="button"
             style=${`--swatch:${c}`}
-            title=${`Color row ${c}`}
             aria-label=${`Color row ${c}`}
             aria-pressed=${current === c ? "true" : "false"}
             @click=${() => setColor(s, current === c ? null : c)}
           ></button>
         `,
       )}
-      <label class="color-swatch custom ${current && !isPreset ? "selected" : ""}" title="Custom color (RGB picker)">
+      <label class="color-swatch custom ${current && !isPreset ? "selected" : ""}" ${tip("Custom color (RGB picker)")}>
         <input
           type="color"
           aria-label="Custom row color"
-          value=${current ?? "#6366f1"}
+          value=${current ?? SESSION_COLORS[3]}
           @click=${(e: Event) => e.stopPropagation()}
           @input=${(e: InputEvent) => previewColor(s, (e.currentTarget as HTMLInputElement).value)}
           @change=${(e: Event) => setColor(s, (e.currentTarget as HTMLInputElement).value)}
@@ -1031,7 +1239,7 @@ function sessionColorRow(s: CoreSession): TemplateResult {
           ? html`<button
               class="color-swatch clear"
               type="button"
-              title="Clear color"
+              ${tip("Clear color")}
               aria-label="Clear row color"
               @click=${() => setColor(s, null)}
             >
@@ -1079,15 +1287,19 @@ function toggleShowArchived(): void {
   renderList();
 }
 
-export function toggleWebOnly(): void {
-  sessionsState.webOnly = !sessionsState.webOnly;
+export function setWebOnly(webOnly: boolean): void {
+  sessionsState.webOnly = webOnly;
   try {
-    localStorage.setItem(WEB_ONLY_KEY, sessionsState.webOnly ? "1" : "0");
+    localStorage.setItem(WEB_ONLY_KEY, webOnly ? "1" : "0");
   } catch {
     void 0;
   }
-  renderSidebarTop();
   renderList();
+}
+
+export function revealSessionSurface(s: CoreSession): void {
+  if (!sessionsState.webOnly || surfaceOf(s) === "web") return;
+  setWebOnly(false);
 }
 
 async function copySessionLink(s: CoreSession): Promise<void> {
@@ -1182,7 +1394,7 @@ export function sessionSelectionBar(): TemplateResult | null {
         <button
           class="icon-btn"
           type="button"
-          title="Clear selection (Esc)"
+          ${tip("Clear selection (Esc)")}
           aria-label="Clear selection"
           @click=${() => clearSessionSelection()}
         >
@@ -1194,7 +1406,7 @@ export function sessionSelectionBar(): TemplateResult | null {
         <button
           class="icon-btn"
           type="button"
-          title=${allPinned ? "Unpin selected" : "Pin selected"}
+          ${tip(allPinned ? "Unpin selected" : "Pin selected")}
           aria-label=${allPinned ? "Unpin selected conversations" : "Pin selected conversations"}
           @click=${() => void bulkPatch({ pinned: !allPinned })}
         >
@@ -1204,7 +1416,7 @@ export function sessionSelectionBar(): TemplateResult | null {
           <button
             class="icon-btn"
             type="button"
-            title="Color selected"
+            ${tip("Color selected")}
             aria-label="Color selected conversations"
             aria-haspopup="true"
             aria-expanded=${selectColorOpen ? "true" : "false"}
@@ -1220,7 +1432,7 @@ export function sessionSelectionBar(): TemplateResult | null {
         <button
           class="icon-btn"
           type="button"
-          title=${allArchived ? "Unarchive selected" : "Archive selected"}
+          ${tip(allArchived ? "Unarchive selected" : "Archive selected")}
           aria-label=${allArchived ? "Unarchive selected conversations" : "Archive selected conversations"}
           @click=${() => void bulkPatch({ archived: !allArchived })}
         >
@@ -1253,7 +1465,7 @@ function colorPopover(): TemplateResult {
               class="color-swatch"
               type="button"
               style=${`--swatch:${c}`}
-              title=${`Color selected ${c}`}
+              ${tip(`Color selected ${c}`)}
               aria-label=${`Color selected conversations ${c}`}
               @click=${() => void bulkPatch({ color: c })}
             ></button>
@@ -1262,7 +1474,7 @@ function colorPopover(): TemplateResult {
         <button
           class="color-swatch clear"
           type="button"
-          title="Clear color"
+          ${tip("Clear color")}
           aria-label="Clear color on selected conversations"
           @click=${() => void bulkPatch({ color: null })}
         >
@@ -1400,20 +1612,74 @@ export function sessionsReady(): Promise<void> {
   return sessionsState.loaded ? Promise.resolve() : listReady;
 }
 
-let latestSessionsRefresh: Promise<boolean> | null = null;
+function openConversationIds(): string[] {
+  const opening = sessionsState.openingKey ? [sessionsState.openingKey] : [];
+  return [...opening, ...allConversations().flatMap((conv) => (conv.state.sessionId ? [conv.state.sessionId] : []))];
+}
 
-export function refreshSessions(
-  opts: { showLoading?: boolean; silent?: boolean; refreshContexts?: boolean; patchEpoch?: number } = {},
-): Promise<boolean> {
-  const run: Promise<boolean> = runSessionsRefresh(opts, () =>
-    latestSessionsRefresh === run ? null : latestSessionsRefresh,
+type SessionsRefreshOptions = {
+  showLoading?: boolean;
+  silent?: boolean;
+  refreshContexts?: boolean;
+  patchEpoch?: number;
+};
+let latestSessionsRefresh: Promise<boolean> | null = null;
+let queuedSessionsRefresh: SessionsRefreshOptions | null = null;
+let sessionsRefreshRunning = false;
+let listRequestedAt = 0;
+let listDiscards = 0;
+const LIST_STALL_MS = 10_000;
+
+export function refreshSessionsOnOpen(): void {
+  const joinable =
+    sessionsRefreshRunning && Date.now() - listRequestedAt < LIST_STALL_MS ? latestSessionsRefresh : null;
+  if (!joinable) {
+    void refreshSessions({ silent: true });
+    return;
+  }
+  const discards = listDiscards;
+  void joinable.then(
+    (applied) => {
+      if (applied || listDiscards === discards || latestSessionsRefresh !== joinable) return;
+      void refreshSessions({ silent: true });
+    },
+    () => void 0,
   );
+}
+
+export function refreshSessions(opts: SessionsRefreshOptions = {}): Promise<boolean> {
+  if (sessionsRefreshRunning && Date.now() - listRequestedAt < LIST_STALL_MS && latestSessionsRefresh) {
+    queuedSessionsRefresh = {
+      ...opts,
+      showLoading: queuedSessionsRefresh?.showLoading || opts.showLoading,
+      refreshContexts: queuedSessionsRefresh?.refreshContexts || opts.refreshContexts,
+      silent: queuedSessionsRefresh ? queuedSessionsRefresh.silent && opts.silent : opts.silent,
+    };
+    sessionRefreshSeq++;
+    return latestSessionsRefresh;
+  }
+  sessionsRefreshRunning = true;
+  const isLatest = (): boolean => latestSessionsRefresh === run;
+  const run: Promise<boolean> = (async () => {
+    try {
+      let next: SessionsRefreshOptions | null = opts;
+      let applied: boolean;
+      do {
+        queuedSessionsRefresh = null;
+        applied = await runSessionsRefresh(next, () => (isLatest() ? null : latestSessionsRefresh));
+        next = isLatest() ? queuedSessionsRefresh : null;
+      } while (next);
+      return applied;
+    } finally {
+      if (isLatest()) sessionsRefreshRunning = false;
+    }
+  })();
   latestSessionsRefresh = run;
   return run;
 }
 
 async function runSessionsRefresh(
-  opts: { showLoading?: boolean; silent?: boolean; refreshContexts?: boolean; patchEpoch?: number },
+  opts: SessionsRefreshOptions,
   newerRun: () => Promise<boolean> | null,
 ): Promise<boolean> {
   loadRecentContexts(opts.refreshContexts === true);
@@ -1424,11 +1690,15 @@ async function runSessionsRefresh(
     sessionsNotice = "";
     renderList();
   }
+  listRequestedAt = Date.now();
   try {
     const r = await api<{ sessions: CoreSession[] }>("/api/sessions");
     if (seq !== sessionRefreshSeq) return sessionsState.loaded || ((await newerRun()) ?? false);
-    if (patchEpoch !== sessionPatchEpoch) return false;
-    sessionsState.list = reconcileSessions(r.sessions ?? [], sessionsState.list);
+    if (patchEpoch !== sessionPatchEpoch) {
+      listDiscards++;
+      return false;
+    }
+    sessionsState.list = reconcileSessions(r.sessions ?? [], sessionsState.list, openConversationIds());
     sessionsState.loaded = true;
     sessionsNotice = "";
     return true;
@@ -1442,11 +1712,16 @@ async function runSessionsRefresh(
       listSettled = null;
       sessionsLoading = false;
       renderList();
+      for (const conversation of allConversations()) conversation.redraw();
     }
   }
 }
 
-export async function openSession(s: CoreSession, entriesPrefetch?: Promise<TranscriptPage | null>): Promise<void> {
+export async function openSession(
+  s: CoreSession,
+  entriesPrefetch?: Promise<TranscriptPage | null>,
+  approvalsPrefetch?: Promise<{ approvals: PendingApproval[] } | null>,
+): Promise<void> {
   if (appState.currentView !== "chats") {
     appState.currentView = "chats";
     appState.viewRenderSeq++;
@@ -1456,18 +1731,19 @@ export async function openSession(s: CoreSession, entriesPrefetch?: Promise<Tran
     syncUrlFromState(s.id || null);
   }
   mountRestoredCanvas();
-  if (splitInterceptsOpen(s)) return;
+  const pane = splitInterceptsOpen(s);
   closeSidebarOnNarrowView();
   if (projectName(s.scopeId) && sessionsState.collapsedProjectScopes.delete(s.scopeId)) renderList();
-  return openSessionInto(mainConversation(), s, entriesPrefetch);
+  return openSessionInto(pane ?? mainConversation(), s, entriesPrefetch, approvalsPrefetch, true);
 }
 
 export async function openSessionInto(
   conv: Conversation,
   s: CoreSession,
   entriesPrefetch?: Promise<TranscriptPage | null>,
+  approvalsPrefetch?: Promise<{ approvals: PendingApproval[] } | null>,
+  tracked = conv === mainConversation(),
 ): Promise<void> {
-  const tracked = conv === mainConversation();
   if (!s.id) {
     if (conv.state.threadRef !== s.threadRef) {
       conv.mountContinuable(s.threadRef, null, s.scopeId || null, [], s.channelName ?? null);
@@ -1475,37 +1751,38 @@ export async function openSessionInto(
     }
     return;
   }
-  if (s.id === conv.state.sessionId) return;
+  if (s.id === conv.state.sessionId && !entriesPrefetch) return;
 
-  void refreshSessions({ silent: true });
+  refreshSessionsOnOpen();
 
   const opening = s.id;
   if (tracked) {
     sessionsState.openingKey = opening;
     renderList();
   }
-  const skeletonTimer = window.setTimeout(() => {
-    if (!tracked || sessionsState.openingKey === opening) conv.mountLoadingPane();
-  }, 140);
+  if (!isLiveConversation(conv)) return;
+  const isCurrent = conv.mountLoadingPane();
 
   const fetchEntries = (): Promise<TranscriptPage | null> =>
     fetchTranscript(s.id, { tailTurns: TAIL_TURNS }).catch(() => null);
   const continuable = isContinuable(s, appState.me?.user ?? "");
   const [entriesRes, approvalsRes] = await Promise.all([
     entriesPrefetch ? entriesPrefetch.then((r) => r ?? fetchEntries()) : fetchEntries(),
-    continuable
-      ? api<{ approvals: PendingApproval[] }>(`/api/sessions/${encodeURIComponent(s.id)}/approvals`).catch(() => null)
-      : Promise.resolve(null),
+    continuable ? (approvalsPrefetch ?? fetchSessionApprovals(s.id)) : Promise.resolve(null),
   ]);
-  window.clearTimeout(skeletonTimer);
+  if (!isLiveConversation(conv) || !isCurrent()) return;
 
   if (tracked) {
     if (sessionsState.openingKey !== opening) return;
     sessionsState.openingKey = null;
   }
+  if (!entriesPrefetch && conv.state.sessionId === s.id) {
+    renderList();
+    return;
+  }
 
   if (!entriesRes) {
-    if (tracked) showMainEmpty("Couldn't load this conversation. Check your connection and click it again.");
+    conv.mountLoadError(() => void openSessionInto(conv, s, undefined, undefined, tracked));
     renderList();
     return;
   }
@@ -1522,5 +1799,6 @@ export async function openSessionInto(
   } else {
     conv.mountReadOnly(s, messages, earlier, anchorSeq, inheritedMessages);
   }
+  conv.setPins(entriesRes.pins ?? []);
   renderList();
 }

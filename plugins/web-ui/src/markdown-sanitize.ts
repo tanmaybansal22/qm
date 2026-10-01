@@ -1,10 +1,17 @@
 import { marked } from "marked";
+import { escapeHtml } from "./html-escape.ts";
 import DOMPurify, { type Config } from "dompurify";
 
 export const MARKDOWN_SANITIZE_CONFIG: Config = {
   USE_PROFILES: { html: true, mathMl: true, svg: true },
   ADD_TAGS: ["annotation", "semantics"],
   ADD_ATTR: ["target", "encoding"],
+};
+
+export const SHARED_MARKDOWN_SANITIZE_CONFIG: Config = {
+  ...MARKDOWN_SANITIZE_CONFIG,
+  FORBID_TAGS: ["img", "video", "audio", "source", "iframe", "object", "embed", "style", "form"],
+  FORBID_ATTR: ["href", "xlink:href", "src", "srcset", "poster", "style", "action"],
 };
 
 const SANDBOX_WORKSPACE_LINK = /\shref=(["'])sandbox:\/home\/sprite\/workspace\/([^"']+)\1/gi;
@@ -30,13 +37,21 @@ export function rewriteSandboxFileLinks(html: string): string {
 
 let installed = false;
 
-export function installMarkdownSanitizer(): void {
+export function installMarkdownSanitizer(options: { shared?: boolean } = {}): void {
   if (installed) return;
   installed = true;
   marked.use({
+    walkTokens(token) {
+      if (token.type === "html") token.text = escapeHtml(token.text);
+    },
     hooks: {
       postprocess: (html: string) =>
-        String(DOMPurify.sanitize(rewriteSandboxFileLinks(html), MARKDOWN_SANITIZE_CONFIG)),
+        String(
+          DOMPurify.sanitize(
+            rewriteSandboxFileLinks(html),
+            options.shared ? SHARED_MARKDOWN_SANITIZE_CONFIG : MARKDOWN_SANITIZE_CONFIG,
+          ),
+        ),
     },
   });
 }

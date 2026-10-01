@@ -1,3 +1,4 @@
+import { isSubagentThreadRef } from "../sessions/session-syscalls.ts";
 import type {
   PendingApproval,
   PendingApprovalRecord,
@@ -10,7 +11,8 @@ import type {
 import { orgId as orgIdOf } from "../config.ts";
 import { isManageableCreationScope, parseScopeId, scopeId } from "../types.ts";
 import { type ListOwnedOptions } from "../files/file-artifact-store.ts";
-import type { Run } from "../runs/run-store.ts";
+import { isTerminal, type Run } from "../runs/run-store.ts";
+import { sleep } from "../util/async.ts";
 import type { RunSignal } from "../runs/run-signal-store.ts";
 import { processRun } from "../runs/worker.ts";
 import { deployRef, encodeRef, parseRef } from "../acl/resource-ref.ts";
@@ -25,8 +27,10 @@ import {
   createMembershipControlsScope,
 } from "../resolution/scope-membership.ts";
 import { samePerson } from "../directory/person.ts";
+import { actorAssertionActive } from "../identity/identity-service.ts";
 import type { Deployment } from "../deploy/deploy-store.ts";
 import { swallow } from "../util/errors.ts";
+import { adminSessionUrl } from "../util/admin-links.ts";
 import {
   openGroupViaSurface,
   resolveReachTarget,
@@ -50,7 +54,7 @@ import { toFileItem } from "./app-types.ts";
 export function createAppHelpers(deps: AppDeps, app: App) {
   const adminBase = deps.publicWebUrl?.replace(/\/$/, "");
   const adminLink = (sessionId: string): string | undefined =>
-    adminBase ? `${adminBase}/admin/history?session=${encodeURIComponent(sessionId)}` : undefined;
+    adminBase ? adminSessionUrl(adminBase, sessionId) : undefined;
 
   const surfaceContext = createSurfaceContextPuller(app);
   const directoryRefresher = createSurfaceContextPuller(app, { waitMs: 4_000 });
@@ -86,17 +90,14 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   async function approvalCurrentForSession(session: Session, record: PendingApprovalRecord): Promise<boolean> {
+    if (!actorAssertionActive(deps.identity, record.request?.actor)) return false;
     const parsed = parseScopeId(session.scopeId);
     if (parsed.kind !== "group" || !isProjectGroupRef(parsed.ref)) return true;
-    const requester = record.request?.actor.externalId;
-    return (
-      !!requester &&
-      authorizesCapabilityScope({
-        actorId: requester,
-        scopeId: session.scopeId,
-        scopeVersion: record.request?.scopeVersion,
-      })
-    );
+    return authorizesCapabilityScope({
+      actorId: record.request!.actor.externalId,
+      scopeId: session.scopeId,
+      scopeVersion: record.request?.scopeVersion,
+    });
   }
 
   async function approvalRecordIsCurrent(record: PendingApprovalRecord, knownSession?: Session): Promise<boolean> {
@@ -104,22 +105,46 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     return !!session && approvalCurrentForSession(session, record);
   }
 
+  async function approvalsVisibleToViewer<T extends { record: PendingApprovalRecord }>(
+    session: Session,
+    viewer: string,
+    candidates: T[],
+  ): Promise<T[]> {
+    const own = candidates.filter(({ record }) => samePerson(record.request?.actor.externalId, viewer));
+    if (!own.length) return [];
+    if ((await managedProjectMembership(session.scopeId, viewer)) === false) return [];
+    const parsed = parseScopeId(session.scopeId);
+    if (parsed.kind !== "group" || !isProjectGroupRef(parsed.ref)) return own;
+    const window = (await deps.sessions.participantWindowsOf(session.id)).find((candidate) =>
+      samePerson(candidate.principalId, viewer),
+    );
+    if (!window) return [];
+    return own.filter(
+      ({ record }) =>
+        record.createdAt !== undefined &&
+        record.createdAt >= window.validFrom &&
+        (window.validTo === null || record.createdAt < window.validTo),
+    );
+  }
+
   async function approvalVisibleToViewer(
     session: Session,
     viewer: string,
     record: PendingApprovalRecord,
   ): Promise<boolean> {
-    if (record.request?.actor.externalId !== viewer) return false;
-    if ((await managedProjectMembership(session.scopeId, viewer)) === false) return false;
-    const parsed = parseScopeId(session.scopeId);
-    if (parsed.kind !== "group" || !isProjectGroupRef(parsed.ref)) return true;
-    if (!samePerson(record.request?.actor.externalId, viewer) || record.createdAt === undefined) return false;
-    const window = (await deps.sessions.listParticipants()).find(
-      (candidate) => candidate.sessionId === session.id && samePerson(candidate.principalId, viewer),
-    );
-    return (
-      !!window && record.createdAt >= window.validFrom && (window.validTo === null || record.createdAt < window.validTo)
-    );
+    return (await approvalsVisibleToViewer(session, viewer, [{ record }])).length === 1;
+  }
+
+  async function approvalResumable(
+    session: Session,
+    actorId: string,
+    record: PendingApprovalRecord | null | undefined,
+  ): Promise<"ok" | "expired" | "foreign_session" | "stale" | "not_requester"> {
+    if (!record) return "expired";
+    if (record.sessionId !== session.id) return "foreign_session";
+    if (!(await approvalRecordIsCurrent(record, session))) return "stale";
+    if (!(await approvalVisibleToViewer(session, actorId, record))) return "not_requester";
+    return "ok";
   }
 
   async function pendingApprovalForSession(
@@ -134,18 +159,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
       if (record.sessionId !== sessionId || (opts.blockingOnly && record.blocksInput === false)) continue;
       if (await approvalRecordIsCurrent(record, session)) candidates.push({ key, record });
     }
-    const visible = opts.viewer
-      ? (
-          await Promise.all(
-            candidates.map(async (candidate) => ({
-              candidate,
-              allowed: await approvalVisibleToViewer(session, opts.viewer!, candidate.record),
-            })),
-          )
-        )
-          .filter(({ allowed }) => allowed)
-          .map(({ candidate }) => candidate)
-      : candidates;
+    const visible = opts.viewer ? await approvalsVisibleToViewer(session, opts.viewer, candidates) : candidates;
     return visible.map(({ key, record: r }) => ({
       requestId: key,
       command: r.command,
@@ -160,23 +174,23 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     }));
   }
 
-  async function pendingApprovalResultForThread(threadRef: string, viewer?: string): Promise<TurnResult | null> {
+  async function pendingApprovalResultForThread(
+    threadRef: string,
+    viewer?: string,
+    opts: { alwaysBlock?: boolean } = {},
+  ): Promise<TurnResult | null> {
     const session = await deps.sessions.getByThread(threadRef);
     if (!session) return null;
-    if (viewer && !(await sessionsForViewer(viewer)).some((candidate) => candidate.id === session.id)) return null;
-    const all = viewer ? await pendingApprovalForSession(session.id, { blockingOnly: true }) : [];
-    const approvals = await pendingApprovalForSession(session.id, {
-      blockingOnly: true,
-      ...(viewer ? { viewer } : {}),
-    });
+    if (!opts.alwaysBlock && viewer && !(await sessionForViewer(session.id, viewer))) return null;
+    const all = await pendingApprovalForSession(session.id, { blockingOnly: true });
+    if (!all.length) return null;
+    const approvals = viewer ? await pendingApprovalForSession(session.id, { blockingOnly: true, viewer }) : all;
     if (!approvals.length) {
-      return all.length
-        ? {
-            status: "pending_approval",
-            sessionId: session.id,
-            reason: "This conversation is waiting for another project member to resolve a pending approval.",
-          }
-        : null;
+      return {
+        status: "pending_approval",
+        sessionId: session.id,
+        reason: "This conversation is waiting for someone else to resolve a pending approval.",
+      };
     }
     return {
       status: "pending_approval",
@@ -187,16 +201,30 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   async function drive(runId: string): Promise<TurnResult> {
-    const claimed = await deps.runs.claimById(runId, "inline", deps.leaseTtlMs);
-    if (claimed) {
-      return withAdminLink(
-        await processRun({ runs: deps.runs, orchestrator: deps.orchestrator, leaseTtlMs: deps.leaseTtlMs }, claimed),
-      );
+    const timeoutMs = deps.runWaitMs ?? 60_000;
+    const deadline = performance.now() + timeoutMs;
+    for (;;) {
+      const run = await deps.runs.get(runId);
+      if (!run) throw new Error(`run ${runId} not found`);
+      if (isTerminal(run.status)) {
+        return withAdminLink(
+          run.result ?? { status: "failed", sessionId: run.sessionId, reason: "run produced no result" },
+        );
+      }
+      const claimed = await deps.runs.claimForSession(run.sessionId, "inline", deps.leaseTtlMs);
+      if (claimed) {
+        const result = processRun(
+          { runs: deps.runs, orchestrator: deps.orchestrator, leaseTtlMs: deps.leaseTtlMs },
+          claimed,
+        );
+        if (claimed.id === runId) return withAdminLink(await result);
+        await result.catch((error: unknown) => swallow("inline predecessor run failed", error));
+        continue;
+      }
+      const remaining = deadline - performance.now();
+      if (remaining <= 0) throw new Error(`run ${runId} did not finish within ${timeoutMs}ms`);
+      await sleep(Math.min(100, remaining));
     }
-    const finished = await deps.runs.waitFor(runId, deps.runWaitMs);
-    return withAdminLink(
-      finished.result ?? { status: "failed", sessionId: finished.sessionId, reason: "run produced no result" },
-    );
   }
 
   async function mayUseSharedScope(kind: "channel" | "group", ref: string, actor: Principal): Promise<boolean> {
@@ -256,10 +284,20 @@ export function createAppHelpers(deps: AppDeps, app: App) {
 
   async function sessionsForViewer(principalId: string): Promise<Session[]> {
     const sessions = await deps.sessions.listByParticipant(principalId);
-    const allowed = await Promise.all(
-      sessions.map((session) => managedProjectMembership(session.scopeId, principalId)),
+    const allowed = new Map(
+      await Promise.all(
+        [...new Set(sessions.map((session) => session.scopeId))].map(
+          async (scope) => [scope, await managedProjectMembership(scope, principalId)] as const,
+        ),
+      ),
     );
-    return sessions.filter((_session, index) => allowed[index] !== false);
+    return sessions.filter((session) => allowed.get(session.scopeId) !== false);
+  }
+
+  async function sessionForViewer(sessionId: string, principalId: string): Promise<Session | null> {
+    const session = await deps.sessions.getForParticipant(sessionId, principalId);
+    if (!session) return null;
+    return (await managedProjectMembership(session.scopeId, principalId)) === false ? null : session;
   }
 
   async function contextsFor(principalId: string): Promise<ContextSummary[]> {
@@ -318,20 +356,19 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     inScope?: ScopeId,
   ): Promise<FileListPage> {
     const myScopes = await currentResourceScopesForViewer(principalId);
-    const owned = await deps.files.listOwnedByScopes(myScopes, {
-      ...opts,
-      ...(inScope ? { createdInScope: inScope } : {}),
-    });
     const handles = await deps.acl.handlesFor(myScopes);
-    const refs = handles.map((h) => ({ ownerScopeId: h.ownerScopeId, path: h.ownerPath }));
-    const sharedRows = await deps.files.resolveByOwnerPaths(refs);
-    const shared = sharedRows
-      .filter((f) => !myScopes.includes(f.ownerScopeId) && (!inScope || f.createdInScope === inScope))
-      .sort((a, b) => b.updatedAt - a.updatedAt);
+    const page = await deps.files.listDocuments(
+      myScopes,
+      handles.map((h) => ({ ownerScopeId: h.ownerScopeId, path: h.ownerPath })),
+      {
+        ...opts,
+        ...(inScope ? { createdInScope: inScope } : {}),
+      },
+    );
     return {
-      owned: owned.files.map(toFileItem),
-      shared: shared.map(toFileItem),
-      ...(owned.nextCursor ? { nextCursor: owned.nextCursor } : {}),
+      owned: page.files.filter((f) => myScopes.includes(f.ownerScopeId)).map(toFileItem),
+      shared: page.files.filter((f) => !myScopes.includes(f.ownerScopeId)).map(toFileItem),
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
     };
   }
 
@@ -445,7 +482,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     return undefined;
   }
 
-  function canManageSkill(skill: Skill, principalId: string): Promise<boolean> {
+  function canManageSkill(skill: Pick<Skill, "scopeId" | "createdBy">, principalId: string): Promise<boolean> {
     return principalManagesArtifactHome(skill.scopeId, skill.createdBy, principalId);
   }
 
@@ -466,12 +503,20 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   async function effectiveDeploymentPermission(d: Deployment, principalId: string): Promise<Permission | null> {
-    if (!principalId) return null;
+    if (!principalId || deps.identity.deactivationSource?.(principalId) === "manual") return null;
     if (await principalCanWriteScope(principalId, d.ownerScopeId)) return "write";
     let best: Permission | null = (await principalCanAccessCurrentScope(principalId, d.ownerScopeId)) ? "read" : null;
     const grants = (await deps.acl?.grantsFor(d.ownerScopeId, encodeRef(deployRef(d.id))).catch(() => [])) ?? [];
     for (const g of grants) {
       if (g.permission !== "read" && g.permission !== "write") continue;
+      if (
+        g.permission === "read" &&
+        principalId.includes("@") &&
+        g.granteeScopeId === `personal:${principalId.trim().toLowerCase()}`
+      ) {
+        best = "read";
+        continue;
+      }
       if (!(await principalCanAccessCurrentScope(principalId, g.granteeScopeId))) continue;
       if (g.permission === "write" && (await principalCanUseWriteGrant(principalId, g.granteeScopeId))) return "write";
       best = "read";
@@ -483,7 +528,10 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     return (await effectiveDeploymentPermission(d, principalId)) != null;
   }
 
-  async function principalGitPermission(d: Deployment, principalId: string): Promise<"read" | "write" | null> {
+  async function principalGitPermission(
+    d: Pick<Deployment, "id" | "ownerScopeId" | "createdBy" | "createdInScope">,
+    principalId: string,
+  ): Promise<"read" | "write" | null> {
     if (!principalId) return null;
     const { kind } = parseScopeId(d.ownerScopeId);
     if (await principalManagesArtifactHome(d.ownerScopeId, d.createdBy, principalId)) return "write";
@@ -549,9 +597,7 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   }
 
   async function reconcileProjectMember(project: Project, memberId: string, add: boolean): Promise<void> {
-    const sessions = (await deps.sessions.listAll()).filter(
-      (session) => session.scopeId === projectScopeId(project.id),
-    );
+    const sessions = await deps.sessions.listByScope(projectScopeId(project.id));
     for (const session of sessions) {
       if (add) await deps.sessions.addParticipant(session.id, memberId, undefined, { includeHistory: true });
       else await deps.sessions.removeParticipant(session.id, memberId);
@@ -561,39 +607,114 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   async function replayOrphanedRunSignals(runId: string): Promise<Array<{ signal: RunSignal; replayRunId?: string }>> {
     if (!deps.signals) return [];
     const drained: Array<{ signal: RunSignal; replayRunId?: string }> = [];
+    const completed = await deps.runs.get(runId);
+    if (completed && isSubagentThreadRef(completed.sessionId)) {
+      for (const { id, signal } of await deps.signals.pending(runId)) {
+        if (signal.kind === "abort" || signal.kind === "client_result" || !signal.text?.trim()) {
+          await deps.signals.acknowledge(runId, id);
+          continue;
+        }
+        let replayRunId: string | undefined;
+        const dedupKey = `session-signal:${runId}:${id}`;
+        if (signal.sessionRequest) {
+          const { clientTools: _clientTools, ...sessionRequest } = signal.sessionRequest;
+          const { run } = await deps.runs.enqueue({
+            sessionId: completed.sessionId,
+            request: sessionRequest,
+            dedupKey,
+            maxAttempts: deps.maxAttempts,
+          });
+          replayRunId = run.id;
+        } else if (signal.request) {
+          const { approval: _ap, redeliveryKey: _redeliveryKey, clientTools: _clientTools, ...base } = signal.request;
+          const prior = completed.request;
+          const inheritedOptions = {
+            ...(base.model === undefined && prior.model !== undefined ? { model: prior.model } : {}),
+            ...(base.harness === undefined && prior.harness !== undefined ? { harness: prior.harness } : {}),
+            ...(base.thinkingLevel === undefined && prior.thinkingLevel !== undefined
+              ? { thinkingLevel: prior.thinkingLevel }
+              : {}),
+            ...(base.fastMode === undefined && prior.fastMode !== undefined ? { fastMode: prior.fastMode } : {}),
+            ...(base.timezone === undefined && prior.timezone !== undefined ? { timezone: prior.timezone } : {}),
+          };
+          const replayed = await app.turn(
+            { ...base, ...inheritedOptions, async: true, idempotencyKey: dedupKey },
+            { signalDedupKey: dedupKey },
+          );
+          replayRunId = replayed.runId;
+          if (!replayRunId && replayed.status !== "refused") continue;
+        } else {
+          const {
+            approval: _approval,
+            attachments: _attachments,
+            displayText: _display,
+            clientTools: _clientTools,
+            ...request
+          } = completed.request;
+          const { run } = await deps.runs.enqueue({
+            sessionId: completed.sessionId,
+            request: { ...request, text: signal.text, origin: { kind: "automation", screenData: signal.text } },
+            dedupKey,
+            maxAttempts: deps.maxAttempts,
+          });
+          replayRunId = run.id;
+        }
+        await deps.signals.acknowledge(runId, id);
+        drained.push({ signal, ...(replayRunId ? { replayRunId } : {}) });
+      }
+      return drained;
+    }
     for (const signal of await deps.signals.takePending(runId)) {
-      if (signal.kind === "abort") continue;
-      if (!signal.request) {
-        // A steer sent through /v1/runs/:id/signal carries no TurnRequest. Its text is
-        // still a real user message — re-enqueue it on the run's own request instead of
-        // dropping it, so a steer that raced the run's end is never silently lost.
-        const orphanRun = signal.text?.trim() ? await deps.runs.get(runId) : null;
+      if (signal.kind === "abort" || signal.kind === "client_result") continue;
+      let replayRunId: string | undefined;
+      let replayOutcomeKnown = true;
+      if (signal.request) {
+        try {
+          const { approval: _ap, redeliveryKey: _redeliveryKey, clientTools: _clientTools, ...base } = signal.request;
+          const prior = (await deps.runs.get(runId))?.request;
+          const inheritedOptions = {
+            ...(base.model === undefined && prior?.model !== undefined ? { model: prior.model } : {}),
+            ...(base.harness === undefined && prior?.harness !== undefined ? { harness: prior.harness } : {}),
+            ...(base.thinkingLevel === undefined && prior?.thinkingLevel !== undefined
+              ? { thinkingLevel: prior.thinkingLevel }
+              : {}),
+            ...(base.fastMode === undefined && prior?.fastMode !== undefined ? { fastMode: prior.fastMode } : {}),
+            ...(base.timezone === undefined && prior?.timezone !== undefined ? { timezone: prior.timezone } : {}),
+          };
+          const replayed = await app.turn({ ...base, ...inheritedOptions, async: true });
+          replayRunId = replayed.runId;
+        } catch (err) {
+          replayOutcomeKnown = false;
+          swallow(`signals: orphaned-signal replay for run ${runId}`, err);
+        }
+      }
+      if (!replayRunId && replayOutcomeKnown && signal.text?.trim()) {
+        const orphanRun = await deps.runs.get(runId);
         if (orphanRun) {
           try {
-            const { displayText: _d, attachments: _a, approval: _ap, ...base } = orphanRun.request;
+            const {
+              displayText: _d,
+              attachments: _a,
+              approval: _ap,
+              clientTools: _clientTools,
+              ...base
+            } = orphanRun.request;
             const { run: fresh } = await deps.runs.enqueue({
               sessionId: orphanRun.sessionId,
-              request: { ...base, text: signal.text! },
+              request: { ...base, text: signal.text },
             });
-            drained.push({ signal, replayRunId: fresh.id });
-            continue;
+            replayRunId = fresh.id;
           } catch (err) {
             swallow(`signals: requestless orphaned-steer replay for run ${runId}`, err);
           }
         }
+      }
+      if (!replayRunId) {
         console.warn(
-          `[signals] orphaned ${signal.kind} for terminal run ${runId} has no stored request — dropped: ${signal.text?.slice(0, 120) ?? ""}`,
+          `[signals] orphaned ${signal.kind} for terminal run ${runId} could not be replayed — dropped: ${signal.text?.slice(0, 120) ?? ""}`,
         );
-        drained.push({ signal });
-        continue;
       }
-      try {
-        const replayed = await app.turn({ ...signal.request, async: true });
-        drained.push({ signal, ...(replayed.runId ? { replayRunId: replayed.runId } : {}) });
-      } catch (err) {
-        swallow(`signals: orphaned-signal replay for run ${runId}`, err);
-        drained.push({ signal });
-      }
+      drained.push({ signal, ...(replayRunId ? { replayRunId } : {}) });
     }
     return drained;
   }
@@ -601,9 +722,11 @@ export function createAppHelpers(deps: AppDeps, app: App) {
   return {
     adminBase,
     adminLink,
+    directoryMember: (principalId: string) => app.directoryMember(principalId),
     withAdminLink,
     resolveReachTargetFor,
     approvalRecordIsCurrent,
+    approvalResumable,
     approvalVisibleToViewer,
     pendingApprovalForSession,
     pendingApprovalResultForThread,
@@ -614,11 +737,13 @@ export function createAppHelpers(deps: AppDeps, app: App) {
     projectsForViewer,
     managedProjectMembership,
     sessionsForViewer,
+    sessionForViewer,
     contextsFor,
     filesForViewer,
     currentResourceScopesForViewer,
     canUseContext,
     principalCanAccessCurrentScope,
+    principalCanWriteScope,
     principalCanManageScope,
     membershipControlsScope,
     authorizesCapabilityScope,

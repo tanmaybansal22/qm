@@ -29,18 +29,33 @@ test("runtime schema conditions reference env vars the CLI schema also condition
   // so `qm secrets` and core boot validation agree about when a secret becomes required.
   const runtimeConditionEnv = [
     "SANDBOX_BACKEND",
+    "SANDBOX_SCOPE_BACKENDS",
     "DEPLOY_PROVIDER",
     "AWS_DEPLOY_APPS_DOMAIN",
+    "DEPLOY_APPS_DOMAIN",
     "GOOGLE_OAUTH_CLIENT_ID",
     "DROPBOX_OAUTH_CLIENT_ID",
     "LINEAR_OAUTH_CLIENT_ID",
   ];
   const cliConditionEnv = new Set<string>();
-  for (const spec of FIRST_PARTY_SECRET_SPECS) {
-    if (typeof spec.required === "boolean") continue;
-    const when = spec.required.when as { name?: string; names?: string[] };
+  interface CliCondition {
+    kind?: string;
+    name?: string;
+    names?: string[];
+    conditions?: CliCondition[];
+  }
+  const collect = (when: CliCondition): void => {
+    if (when.kind === "sandbox-backend") {
+      cliConditionEnv.add("SANDBOX_BACKEND");
+      cliConditionEnv.add("SANDBOX_SCOPE_BACKENDS");
+    }
     if (when.name) cliConditionEnv.add(when.name);
     for (const name of when.names ?? []) cliConditionEnv.add(name);
+    for (const nested of when.conditions ?? []) collect(nested);
+  };
+  for (const spec of FIRST_PARTY_SECRET_SPECS) {
+    if (typeof spec.required === "boolean") continue;
+    collect(spec.required.when as CliCondition);
   }
   const missing = runtimeConditionEnv.filter((name) => !cliConditionEnv.has(name));
   assert.deepEqual(

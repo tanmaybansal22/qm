@@ -8,10 +8,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends iptables && rm 
 WORKDIR /app
 
 COPY package.json package-lock.json ./
+COPY .husky/install.mjs .husky/install.mjs
 RUN npm ci --omit=dev
 
 COPY src ./src
+COPY plugins/chassis ./plugins/chassis
 COPY tsconfig.json ./
+RUN node --input-type=module -e "await import('./src/egress-authz-main.ts')"
 COPY deploy/egress-proxy/envoy.yaml deploy/egress-proxy/start.sh ./
 RUN chmod +x start.sh
 # A rejected config is a fleet-wide outage: start.sh kills the container when Envoy dies, so an

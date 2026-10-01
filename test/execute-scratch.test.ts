@@ -1,3 +1,6 @@
+import { SandboxProvisionCleanupError, cleanupFailedProvision } from "../src/sandbox/sandbox.ts";
+import { execFileSync } from "node:child_process";
+import { createTurnSandboxes, type TurnSandboxContext } from "../src/core/orchestrator/sandboxes.ts";
 import { fakeSprites } from "./support/auto-fake-sprites.ts";
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -6,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { buildApp } from "../src/wiring.ts";
 import type { Config } from "../src/config.ts";
-import { createPiTools, type ToolContextRef } from "../src/harness/pi-tools.ts";
+import { createAgentTools, type ToolContextRef } from "../src/harness/agent-tools.ts";
 import { createToolContext, type ToolContext, type ToolContextDeps } from "../src/tools/primitives.ts";
 import { scopeId, type TurnRequest, type WorkspaceLayer } from "../src/types.ts";
 import type { Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
@@ -72,19 +75,19 @@ function sinkToolContext() {
 }
 
 const textOf = (r: unknown): string => (r as { content: Array<{ text: string }> }).content[0]?.text ?? "";
-const call = (tool: ReturnType<typeof createPiTools>[number] | undefined, params: unknown) => {
+const call = (tool: ReturnType<typeof createAgentTools>[number] | undefined, params: unknown) => {
   assert.ok(tool);
   return (tool.execute as unknown as (id: string, p: unknown) => Promise<unknown>)("t", params);
 };
-const schemaProps = (tool: ReturnType<typeof createPiTools>[number]): string[] =>
+const schemaProps = (tool: ReturnType<typeof createAgentTools>[number]): string[] =>
   Object.keys((tool as unknown as { parameters: { properties: Record<string, unknown> } }).parameters.properties);
-const schemaRequired = (tool: ReturnType<typeof createPiTools>[number]): string[] =>
+const schemaRequired = (tool: ReturnType<typeof createAgentTools>[number]): string[] =>
   (tool as unknown as { parameters: { required?: string[] } }).parameters.required ?? [];
 
 test("flag OFF: the execute surface is exactly the legacy one (no scope/durable, scoped box)", async () => {
   const { tc, seen } = sinkToolContext();
-  const [execute] = createPiTools({ current: tc });
-  assert.deepEqual(schemaProps(execute!), ["command", "computer", "purpose", "timeout_seconds"]);
+  const [execute] = createAgentTools({ current: tc });
+  assert.deepEqual(schemaProps(execute!), ["command", "sandbox_id", "purpose", "timeout_seconds", "credentials"]);
   assert.deepEqual(schemaRequired(execute!), ["command", "purpose"]);
   await call(execute, { command: "echo hi" });
   assert.deepEqual(seen, [{ command: "echo hi", opts: undefined }]);
@@ -93,8 +96,16 @@ test("flag OFF: the execute surface is exactly the legacy one (no scope/durable,
 test("flag ON: scope defaults to the durable scoped box; scratch is an explicit opt-in", async () => {
   const { tc, seen } = sinkToolContext();
   const ref: ToolContextRef = { current: tc };
-  const [execute] = createPiTools(ref, { scratchExec: true });
-  assert.deepEqual(schemaProps(execute!), ["command", "computer", "purpose", "timeout_seconds", "scope", "durable"]);
+  const [execute] = createAgentTools(ref, { scratchExec: true });
+  assert.deepEqual(schemaProps(execute!), [
+    "command",
+    "sandbox_id",
+    "purpose",
+    "timeout_seconds",
+    "credentials",
+    "scope",
+    "durable",
+  ]);
 
   await call(execute, { command: "echo hi" });
   assert.deepEqual(
@@ -115,7 +126,7 @@ test("flag ON: scope defaults to the durable scoped box; scratch is an explicit 
 
 test("flag ON: unsupported scope/durable pairings return a crisp [error] without executing", async () => {
   const { tc, seen } = sinkToolContext();
-  const [execute] = createPiTools({ current: tc }, { scratchExec: true });
+  const [execute] = createAgentTools({ current: tc }, { scratchExec: true });
 
   const e1 = textOf(await call(execute, { command: "echo hi", scope: "scratch", durable: true }));
   assert.match(e1, /\[error\] a scratch box cannot be made durable yet/);
@@ -136,7 +147,7 @@ test("flag ON: the tool_call/tool_result entries record which box ran the comman
     },
     scopeLabel: scopeId("personal", "U1"),
   };
-  const [execute] = createPiTools(ref, { scratchExec: true });
+  const [execute] = createAgentTools(ref, { scratchExec: true });
   await call(execute, { command: "echo hi", scope: "scratch" });
   await call(execute, { command: "echo hi" });
   assert.deepEqual(
@@ -147,14 +158,16 @@ test("flag ON: the tool_call/tool_result entries record which box ran the comman
 
 test("flag ON: the description advertises the routing policy truthfully", () => {
   const { tc } = sinkToolContext();
-  const [legacy] = createPiTools({ current: tc });
-  const [execute] = createPiTools({ current: tc }, { scratchExec: true });
+  const [legacy] = createAgentTools({ current: tc });
+  const [execute] = createAgentTools({ current: tc }, { scratchExec: true });
   const desc = (execute as unknown as { description: string }).description;
   assert.match(desc, /"scoped" \(DEFAULT\)/);
-  assert.match(desc, /reasonably confident/);
-  assert.match(desc, /NO logins, NO credentials/);
-  assert.match(desc, /NOTHING persists/);
-  assert.match(desc, /re-run it with scope:"scoped"/);
+  assert.match(desc, /Use it for self-contained commands and API work/);
+  assert.match(desc, /only credentials explicitly requested/);
+  assert.doesNotMatch(JSON.stringify(execute), /credential-free|blank, instant/);
+  assert.match(desc, /including Files/);
+  assert.match(desc, /local files are discarded after the turn/);
+  assert.match(desc, /Use scope:"scoped" when you need existing workspace files/);
   assert.doesNotMatch((legacy as unknown as { description: string }).description, /scratch/i);
 });
 
@@ -173,7 +186,7 @@ const dm = (text: string): TurnRequest => ({
   text,
 });
 
-test("a scratch turn runs on a separate volumeless box with NO capability tokens in its env", async () => {
+test("a scratch turn runs on a separate volumeless box with scoped capability tokens", async () => {
   const { app } = freshApp({ signingSecret: "s3cret", apiBaseUrl: "https://core.test" });
 
   const scoped = await app.turn(dm("!run printenv AGENT_API_TOKEN"));
@@ -185,7 +198,7 @@ test("a scratch turn runs on a separate volumeless box with NO capability tokens
 
   const scratch = await app.turn(dm("!scratch printenv AGENT_API_TOKEN"));
   assert.equal(scratch.status, "ok");
-  assert.equal(scratch.reply, "(exit 1)", "the scratch box is credential-free — no capability token");
+  assert.equal(scratch.reply, "<redacted:credential>", "scoped capability tokens are usable but masked in output");
 
   assert.ok(
     fakeSprites.names().some((n) => n.startsWith("qm-personal-u1-")),
@@ -209,37 +222,13 @@ test("nothing on the scratch box survives the turn", async () => {
   assert.equal(second.reply, "clean", "the release reset blanked the box between turns");
 });
 
-test("a deliverable produced in a scratch run still ships via $AGENT_OUTBOX", async () => {
+test("a deliverable has to live on the scoped computer — the scratch box can't be attached from", async () => {
   const { app } = freshApp();
-  const res = await app.turn(
-    dm('!scratch sh -c "mkdir -p $AGENT_OUTBOX && printf hello > $AGENT_OUTBOX/from-scratch.txt && echo made"'),
-  );
-  assert.equal(res.status, "ok");
-  assert.deepEqual(
-    res.attachments?.map((a) => a.name),
-    ["from-scratch.txt"],
-    "outbox collection covers the scratch box too",
-  );
-});
-
-test("$AGENT_OUTBOX is absolute, so a file delivered after cd'ing away from the workspace still attaches", async () => {
-  const { app } = freshApp();
-  const env = await app.turn(dm("!run printenv AGENT_OUTBOX"));
-  assert.equal(env.status, "ok");
-  assert.match(
-    env.reply ?? "",
-    /^\/.*\/\.agent-turn\/[a-f0-9]{24}\/[a-z0-9]+-[a-f0-9]{24}\/outbox$/,
-    "AGENT_OUTBOX is an absolute, turn-private outbox path",
-  );
-  const res = await app.turn(
-    dm('!run sh -c "cd /tmp && mkdir -p $AGENT_OUTBOX && printf hi > $AGENT_OUTBOX/from-tmp.txt && echo sent"'),
-  );
-  assert.equal(res.status, "ok");
-  assert.deepEqual(
-    res.attachments?.map((a) => a.name),
-    ["from-tmp.txt"],
-    "a file copied to $AGENT_OUTBOX from /tmp is still collected",
-  );
+  const made = await app.turn(dm('!scratch sh -c "printf hello > from-scratch.txt && echo made"'));
+  assert.equal(made.reply, "made");
+  const res = await app.turn(dm("!attach from-scratch.txt"));
+  assert.equal(res.attachments, undefined, "the scratch box is wiped and invisible to attach");
+  assert.match(res.reply ?? "", /not attached.*from-scratch\.txt \(not found\)/);
 });
 
 test("a scratch-only turn still reclaims its box (reset + suspend) when the turn ends", async () => {
@@ -253,3 +242,504 @@ test("a scratch-only turn still reclaims its box (reset + suspend) when the turn
   await app.turn(dm("!scratch echo hi"));
   assert.equal(toreDown, 1, "the scratch box is released exactly once per turn");
 });
+
+test("execute exposes only requested keychain environment values to one command", async () => {
+  const seen: Array<Record<string, string> | undefined> = [];
+  const sandbox = {
+    async run(handle: SandboxHandle) {
+      seen.push(handle.env);
+      return { stdout: "ok", stderr: "", code: 0, timedOut: false };
+    },
+  } as unknown as Sandbox;
+  const { ctx } = routingCtx({
+    sandbox,
+    commandCredentials: [
+      { handle: "kc_github12345", env: [{ key: "GITHUB_TOKEN", value: "secret" }] },
+      { handle: "kc_npm123456789", env: [{ key: "NPM_TOKEN", value: "other" }] },
+    ],
+  });
+
+  await ctx.execute("env");
+  await ctx.execute("env", { credentials: ["kc_github12345"] });
+
+  assert.equal(seen[0]?.GITHUB_TOKEN, undefined);
+  assert.equal(seen[1]?.GITHUB_TOKEN, "secret");
+  assert.equal(seen[1]?.NPM_TOKEN, undefined);
+  assert.equal(scopedHandle.env, undefined, "command credentials never mutate SandboxHandle");
+});
+
+test("execute rejects unavailable, conflicting, and reached credential requests", async () => {
+  const { ctx } = routingCtx({
+    commandCredentials: [
+      { handle: "kc_one12345678", env: [{ key: "TOKEN", value: "one" }] },
+      { handle: "kc_two12345678", env: [{ key: "TOKEN", value: "two" }] },
+    ],
+  });
+
+  await assert.rejects(ctx.execute("true", { credentials: ["kc_missing"] }), /not available/);
+  await assert.rejects(
+    ctx.execute("true", { credentials: ["kc_one12345678", "kc_two12345678"] }),
+    /conflicting environment key/,
+  );
+  await assert.rejects(
+    ctx.execute("true", { reachTarget: "#other", credentials: ["kc_one12345678"] }),
+    /scoped, scratch, or owner computers/,
+  );
+});
+
+test("execute schema lists exact command credential handles", async () => {
+  const { tc, seen } = sinkToolContext();
+  const [execute] = createAgentTools({ current: tc }, { commandCredentialHandles: ["kc_github12345"] });
+  assert.deepEqual(schemaProps(execute!), ["command", "sandbox_id", "purpose", "timeout_seconds", "credentials"]);
+
+  await call(execute, { command: "gh api user", credentials: ["kc_github12345"] });
+  assert.deepEqual(seen.at(-1)?.opts, { credentials: ["kc_github12345"] });
+});
+
+test("migrateComputer gates on approval, validates the target, bounds the copy, and settles routing", async () => {
+  const migrated: Array<{ scope: string; to: string; reason?: string; opts?: unknown }> = [];
+  const audited: string[] = [];
+  let invalidated = 0;
+  const runner = {
+    migrateScope: async (scope: string, to: string, reason?: string, opts?: unknown) => {
+      migrated.push({ scope, to, ...(reason ? { reason } : {}), opts });
+      return {
+        scopeId: scope,
+        from: "e2b",
+        to,
+        resynced: false,
+        capabilitiesLost: [],
+        bytes: 1,
+        sha: "shashasha1234",
+        sourceFiles: 1,
+      };
+    },
+    listRoutes: async () => [],
+    availableBackends: () => ["e2b", "modal"],
+    defaultBackend: "e2b",
+  };
+  const base = {
+    sandboxMigration: runner as never,
+    migrateSettleMs: 0,
+    invalidateProvision: () => {
+      invalidated++;
+    },
+    auditLog: { record: (e: { action: string }) => audited.push(e.action) } as never,
+  };
+
+  const unapproved = routingCtx(base);
+  await assert.rejects(unapproved.ctx.migrateComputer("modal"), (e: Error) => e.name === "NeedsApproval");
+
+  const { ctx } = routingCtx({ ...base, authorizeCommand: (c: string) => c === 'computer:"migrate" to:"modal"' });
+  await assert.rejects(ctx.migrateComputer("sprites"), /not an available backend here.*e2b, modal/);
+  const moved = await ctx.migrateComputer("modal");
+  assert.deepEqual(moved, { from: "e2b", to: "modal" });
+  assert.deepEqual(migrated, [
+    { scope: scopeId("personal", "U1"), to: "modal", reason: "agent-requested", opts: { copyTimeoutSec: 1800 } },
+  ]);
+  assert.equal(invalidated, 1, "the turn's provision memo is cleared so the next command lands on the new box");
+  assert.deepEqual(audited, ["sandbox_routes.migrate"]);
+});
+
+test("migrateComputer rewords the operator-only force refusal and audits failures", async () => {
+  const audited: string[] = [];
+  const runner = {
+    migrateScope: async () => {
+      throw new Error("cannot migrate to sprites: it has no process sessions. Migrate with force to accept the loss.");
+    },
+    listRoutes: async () => [],
+    availableBackends: () => ["e2b", "sprites"],
+    defaultBackend: "e2b",
+  };
+  const { ctx } = routingCtx({
+    sandboxMigration: runner as never,
+    migrateSettleMs: 0,
+    authorizeCommand: () => true,
+    auditLog: { record: (e: { action: string }) => audited.push(e.action) } as never,
+  });
+  await assert.rejects(ctx.migrateComputer("sprites"), /An operator can force this from the admin console\./);
+  await assert.rejects(ctx.migrateComputer("sprites"), (e: Error) => !/Migrate with force/.test(e.message));
+  assert.deepEqual(audited, ["sandbox_routes.migrate_failed", "sandbox_routes.migrate_failed"]);
+});
+
+test("migrateComputer without a wired runner fails loudly", async () => {
+  const { ctx } = routingCtx({ authorizeCommand: () => true });
+  await assert.rejects(ctx.migrateComputer("modal"), /not available on this deployment/);
+});
+
+test("execute masks credential output before model delivery, screening, and transcript logging", async () => {
+  const secret = "execution-secret-123456";
+  const emitted: unknown[] = [];
+  const screened: unknown[] = [];
+  const { ctx } = routingCtx({
+    sandbox: {
+      async run() {
+        return { stdout: `safe prefix ${secret} safe suffix`, stderr: "useful diagnostics", code: 0, timedOut: false };
+      },
+    } as unknown as Sandbox,
+    commandCredentials: [{ handle: "kc_test123456", env: [{ key: "TOKEN", value: secret }] }],
+  });
+  const [execute] = createAgentTools(
+    {
+      current: ctx,
+      scopeLabel: scopeId("personal", "U1"),
+      emit: async (entry) => {
+        emitted.push(entry);
+      },
+      screenToolResult: async (input) => {
+        screened.push(input);
+        return { outcome: "allow" };
+      },
+    },
+    { commandCredentialHandles: ["kc_test123456"] },
+  );
+  const result = await call(execute, { command: "diagnose", credentials: ["kc_test123456"] });
+  const all = JSON.stringify({ result, emitted, screened });
+  assert.ok(!all.includes(secret));
+  assert.ok(all.includes("useful diagnostics"));
+  assert.match(textOf(result), /<redacted:credential>/);
+  assert.match(textOf(result), /exit 0/);
+  assert.equal(screened.length, 1);
+  assert.ok(
+    emitted.some((entry) => {
+      const e = entry as { type?: string; payload?: { isError?: boolean; code?: number } };
+      return e.type === "tool_result" && e.payload?.isError === false && e.payload?.code === 0;
+    }),
+  );
+});
+
+test("execute checks only the current execution environment, including inherited credentials", async () => {
+  const inherited = "inherited-secret-1234";
+  const unselected = "unselected-secret-5678";
+  let output = unselected;
+  const { ctx } = routingCtx({
+    provision: async () => ({ ...scopedHandle, env: { TOKEN: inherited, AWS_REGION: "us-west-2" } }),
+    sandbox: {
+      async run() {
+        return { stdout: output, stderr: "", code: 0, timedOut: false };
+      },
+    } as unknown as Sandbox,
+    commandCredentials: [{ handle: "kc_unused1234", env: [{ key: "OTHER_TOKEN", value: unselected }] }],
+  });
+  assert.equal((await ctx.execute("diagnose")).stdout, unselected);
+  output = "us-west-2";
+  assert.equal((await ctx.execute("diagnose")).stdout, output);
+  output = inherited;
+  assert.equal((await ctx.execute("diagnose")).stdout, "<redacted:credential>");
+});
+
+test("execute replaces credential-bearing provider errors without retaining the original cause", async () => {
+  const secret = "provider-secret-12345";
+  const { ctx } = routingCtx({
+    provision: async () => ({ ...scopedHandle, env: { TOKEN: secret } }),
+    sandbox: {
+      async run() {
+        throw new Error(`provider returned ${secret}`);
+      },
+    } as unknown as Sandbox,
+  });
+  await assert.rejects(ctx.execute("diagnose"), (error: Error) => {
+    assert.equal(error.message, "provider returned <redacted:credential>");
+    assert.ok(!error.stack?.includes(secret));
+    assert.equal(error.cause, undefined);
+    return true;
+  });
+});
+
+test("execute records a safe provider-error result for native replay", async () => {
+  const secret = "provider-secret-12345";
+  const entries: unknown[] = [];
+  const { ctx } = routingCtx({
+    provision: async () => ({ ...scopedHandle, env: { TOKEN: secret } }),
+    sandbox: {
+      async run() {
+        throw new Error(`provider returned ${secret}`);
+      },
+    } as unknown as Sandbox,
+  });
+  const [execute] = createAgentTools({
+    current: ctx,
+    scopeLabel: scopeId("personal", "U1"),
+    emit: async (entry) => {
+      entries.push(entry);
+    },
+  });
+  const result = await call(execute, { command: "diagnose" });
+  assert.match(textOf(result), /<redacted:credential>/);
+  assert.ok(!JSON.stringify({ result, entries }).includes(secret));
+  assert.ok(entries.some((entry) => (entry as { type?: string }).type === "tool_result"));
+});
+
+test("execute respects secret metadata even for configuration-named credentials", async () => {
+  const { ctx } = routingCtx({
+    sandbox: {
+      async run() {
+        return { stdout: "credential", stderr: "", code: 0, timedOut: false };
+      },
+    } as unknown as Sandbox,
+    commandCredentials: [
+      {
+        handle: "kc_config1234",
+        env: [
+          { key: "AWS_REGION", value: "credential", secret: true },
+          { key: "USERNAME", value: "a", secret: false },
+        ],
+      },
+    ],
+  });
+  assert.equal((await ctx.execute("diagnose", { credentials: ["kc_config1234"] })).stdout, "<redacted:credential>");
+});
+
+test("owner execute masks selected credentials and inherited proxy credentials", async () => {
+  const { ctx } = routingCtx({
+    provisionOwnerAuth: async () => ({ ...scopedHandle, env: { HTTPS_PROXY: "https://user:proxy-secret@proxy.test" } }),
+    commandCredentials: [{ handle: "owner-token", scope: "owner", env: [{ key: "TOKEN", value: "owner-secret" }] }],
+    sandbox: {
+      async run() {
+        return { stdout: "owner-secret https://user:proxy-secret@proxy.test", stderr: "", code: 0, timedOut: false };
+      },
+    } as unknown as Sandbox,
+  });
+  assert.equal(
+    (await ctx.execute("diagnose", { ownerAuth: true, credentials: ["owner-token"] })).stdout,
+    "<redacted:credential> <redacted:credential>",
+  );
+});
+
+test("scoped command wrappers preserve selected AWS credentials and clear unselected ambient keys", async () => {
+  const boxes = createTurnSandboxes({
+    deps: {},
+    input: {},
+    connectorEnv: {},
+    credentialCutoverServices: ["role-service"],
+    resolution: { layers: [] },
+  } as unknown as TurnSandboxContext);
+  const { ctx } = routingCtx({
+    scopedCommand: boxes.scopedCommand,
+    commandCredentials: [{ handle: "selected-aws", env: [{ key: "AWS_ACCESS_KEY_ID", value: "selected-key" }] }],
+    sandbox: {
+      async run(handle: SandboxHandle, command: string) {
+        const stdout = execFileSync("/bin/sh", ["-c", command], {
+          env: { AWS_SECRET_ACCESS_KEY: "stale", ...handle.env },
+          encoding: "utf8",
+        });
+        return { stdout, stderr: "", code: 0, timedOut: false };
+      },
+    } as unknown as Sandbox,
+  });
+  const result = await ctx.execute(
+    'test "$AWS_ACCESS_KEY_ID" = selected-key && test "${AWS_SECRET_ACCESS_KEY-unset}" = unset && printf passed',
+    { credentials: ["selected-aws"] },
+  );
+  assert.equal(result.stdout, "passed");
+});
+
+test("scratch credentials are selected per command and masked before returning", async () => {
+  const environments: Array<Record<string, string> | undefined> = [];
+  const { ctx } = routingCtx({
+    provisionScratch: async () => ({ ...scratchHandle, env: { AGENT_API_TOKEN: "scope-capability" } }),
+    commandCredentials: [
+      { handle: "selected", env: [{ key: "TOKEN", value: "selected-secret" }] },
+      { handle: "unselected", env: [{ key: "OTHER_TOKEN", value: "other-secret" }] },
+      { handle: "owner", scope: "owner", env: [{ key: "OWNER_TOKEN", value: "owner-secret" }] },
+    ],
+    sandbox: {
+      async run(handle: SandboxHandle) {
+        environments.push(handle.env);
+        return { stdout: Object.values(handle.env ?? {}).join(" "), stderr: "", code: 0, timedOut: false };
+      },
+    } as unknown as Sandbox,
+  });
+  const result = await ctx.execute("env", { scratch: true, credentials: ["selected"] });
+  assert.equal(result.stdout, "<redacted:credential> <redacted:credential>");
+  assert.equal(environments[0]?.TOKEN, "selected-secret");
+  assert.equal(environments[0]?.OTHER_TOKEN, undefined);
+  await ctx.execute("env", { scratch: true });
+  assert.equal(environments[1]?.TOKEN, undefined);
+  await assert.rejects(ctx.execute("env", { scratch: true, credentials: ["owner"] }), /requires scope:owner/);
+});
+
+function turnBoxes(sandbox: Partial<Sandbox>, transferId = "turn-a") {
+  const events: import("../src/audit/audit-log.ts").AuditEvent[] = [];
+  const errors: unknown[] = [];
+  const boxes = createTurnSandboxes({
+    deps: {
+      sandbox,
+      auditLog: { record: (event: import("../src/audit/audit-log.ts").AuditEvent) => events.push(event) },
+      errors: { record: (...args: unknown[]) => errors.push(args) },
+    },
+    input: { runId: "run-1" },
+    actor: { id: "U1" },
+    session: { id: "session-1" },
+    transferId,
+    scopeId: scopeId("channel", "C1"),
+    memoryScopeId: scopeId("channel", "C1"),
+    connectorEnv: { AGENT_API_TOKEN: "scope-capability" },
+    credentialCutoverServices: [],
+    resolution: {
+      layers: [
+        { scopeId: scopeId("channel", "C1"), mode: "rw", mountPath: "" },
+        { scopeId: scopeId("org", "global"), mode: "ro", mountPath: "global" },
+      ],
+    },
+  } as unknown as TurnSandboxContext);
+  return { boxes, events, errors };
+}
+
+test("scratch provisioning is singleflight within a turn and isolated across turns", async () => {
+  const provisions: Parameters<Sandbox["provision"]>[] = [];
+  const releases: Parameters<Sandbox["teardown"]>[] = [];
+  const sandbox: Partial<Sandbox> = {
+    async provision(...args) {
+      provisions.push(args);
+      await Promise.resolve();
+      return { ...scratchHandle, id: args[1]!.scratch!.key, backend: "local" };
+    },
+    async teardown(...args) {
+      releases.push(args);
+    },
+  };
+  const first = turnBoxes(sandbox);
+  const second = turnBoxes(sandbox, "turn-b");
+  const [a, b, c] = await Promise.all([
+    first.boxes.provisionScratch(),
+    first.boxes.provisionScratch(),
+    second.boxes.provisionScratch(),
+  ]);
+  assert.equal(a, b);
+  assert.notEqual(a.id, c.id);
+  assert.equal(provisions.length, 2);
+  for (const [layers, opts] of provisions) {
+    assert.deepEqual(
+      layers.map((layer) => layer.mountPath),
+      ["global"],
+    );
+    assert.deepEqual(opts?.env, { AGENT_API_TOKEN: "scope-capability" });
+  }
+  await first.boxes.reclaimBox();
+  await second.boxes.reclaimBox();
+  assert.equal(releases.length, 2);
+  assert.ok(releases.every(([, opts]) => opts?.destroy === true));
+  assert.deepEqual(
+    first.events.map((event) => event.action),
+    ["sandbox.scratch.provision_started", "sandbox.scratch.provision_ready", "sandbox.scratch.released"],
+  );
+  assert.equal(new Set(first.events.map((event) => event.resource)).size, 1);
+  const detail = JSON.parse(first.events.at(-1)!.detail!);
+  assert.equal(detail.runId, "run-1");
+  assert.equal(detail.sessionId, "session-1");
+  assert.equal(detail.sandboxId, a.id);
+  assert.equal(detail.backend, "local");
+  assert.ok(detail.cleanupMs >= 0);
+  assert.ok(!JSON.stringify(first.events).includes("scope-capability"));
+});
+
+test("reclaim waits for in-flight scratch creation before destroying its handle", async () => {
+  const ready = Promise.withResolvers<SandboxHandle>();
+  const destroyed: string[] = [];
+  const { boxes } = turnBoxes({
+    provision: () => ready.promise,
+    async teardown(handle) {
+      destroyed.push(handle.id);
+    },
+  });
+  const provision = boxes.provisionScratch();
+  const reclaim = boxes.reclaimBox();
+  ready.resolve(scratchHandle);
+  await Promise.all([provision, reclaim]);
+  assert.deepEqual(destroyed, [scratchHandle.id]);
+  assert.equal(boxes.scratchBox.handle, null);
+});
+
+test("scratch destruction failures remain visible and retain the handle for retry", async () => {
+  let attempts = 0;
+  let fail = true;
+  const { boxes, events, errors } = turnBoxes({
+    async provision() {
+      return scratchHandle;
+    },
+    async teardown() {
+      attempts++;
+      if (fail) throw new Error("sentinel-secret");
+    },
+  });
+  await boxes.provisionScratch();
+  await assert.rejects(boxes.reclaimBox(), (error: Error) => {
+    assert.equal(error.message, "Disposable sandbox destruction failed");
+    assert.equal(error.cause, undefined);
+    assert.ok(!error.stack?.includes("sentinel-secret"));
+    return true;
+  });
+  assert.equal(attempts, 3);
+  assert.equal(boxes.scratchBox.handle, scratchHandle);
+  assert.equal(events.filter((event) => event.action === "sandbox.scratch.release_failed").length, 1);
+  assert.equal(events.filter((event) => event.action === "sandbox.scratch.released").length, 0);
+  assert.ok(!JSON.stringify({ events, errors }).includes("sentinel-secret"));
+  assert.equal(errors.length, 1);
+  fail = false;
+  await boxes.reclaimBox();
+  assert.equal(boxes.scratchBox.handle, null);
+});
+
+test("failed scratch provisioning is audited safely and can retry", async () => {
+  let attempts = 0;
+  const { boxes, events } = turnBoxes({
+    async provision() {
+      if (attempts++ === 0) throw new Error("sentinel-secret");
+      return scratchHandle;
+    },
+    async teardown() {},
+  });
+  await assert.rejects(boxes.provisionScratch(), /sentinel-secret/);
+  await boxes.provisionScratch();
+  await boxes.reclaimBox();
+  assert.deepEqual(
+    events.map((event) => event.action),
+    [
+      "sandbox.scratch.provision_started",
+      "sandbox.scratch.provision_failed",
+      "sandbox.scratch.provision_started",
+      "sandbox.scratch.provision_ready",
+      "sandbox.scratch.released",
+    ],
+  );
+  assert.ok(!JSON.stringify(events).includes("sentinel-secret"));
+});
+
+for (const recovers of [true, false]) {
+  test(`failed scratch initialization preserves safe cleanup identity; recovery=${recovers}`, async () => {
+    let destroys = 0;
+    const partial = { ...scratchHandle, backend: "local", env: { TOKEN: "sentinel-secret" } };
+    const sandbox: Partial<Sandbox> = {
+      async provision() {
+        await cleanupFailedProvision({ teardown: sandbox.teardown! }, partial);
+        throw new Error("initialization failed");
+      },
+      async teardown(handle, opts) {
+        assert.equal(handle.id, partial.id);
+        assert.equal(opts?.destroy, true);
+        if (destroys++ === 0 || !recovers) throw new Error("sentinel-secret");
+      },
+    };
+    const { boxes, events, errors } = turnBoxes(sandbox);
+    await assert.rejects(boxes.provisionScratch(), (error: Error) => {
+      assert.ok(error instanceof SandboxProvisionCleanupError);
+      assert.equal(error.handle.id, partial.id);
+      assert.equal(error.handle.env, undefined);
+      assert.equal(error.cause, undefined);
+      assert.ok(!JSON.stringify(error).includes("sentinel-secret"));
+      return true;
+    });
+    await assert.rejects(boxes.provisionScratch(), /cleanup is still pending/);
+    assert.equal(boxes.scratchBox.handle, null);
+    assert.equal(boxes.scratchBox.pending?.id, partial.id);
+    if (recovers) await boxes.reclaimBox();
+    else await assert.rejects(boxes.reclaimBox(), /Disposable sandbox destruction failed/);
+    const failure = events.find((event) => event.action === "sandbox.scratch.provision_failed")!;
+    assert.equal(JSON.parse(failure.detail!).sandboxId, partial.id);
+    assert.equal(JSON.parse(failure.detail!).backend, "local");
+    assert.equal(events.at(-1)?.action, `sandbox.scratch.${recovers ? "released" : "release_failed"}`);
+    assert.ok(!JSON.stringify({ events, errors }).includes("sentinel-secret"));
+    assert.equal(boxes.scratchBox.pending === null, recovers);
+  });
+}

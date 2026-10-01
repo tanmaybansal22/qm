@@ -9,6 +9,7 @@ before(async () => {
   if (!URL) return;
   const pg = (await import("pg")).default;
   const p = new pg.Pool({ connectionString: URL });
+  await p.query("DROP TABLE IF EXISTS qm_schema_migrations CASCADE");
   await p.query(
     "DROP TABLE IF EXISTS directory_members, directory_channels, directory_channel_members, directory_groups, directory_group_members, directory_sync, directory_meta CASCADE",
   );
@@ -469,3 +470,14 @@ test(
     assert.equal(await store.groupMember("G-idem", "U-alice"), true);
   },
 );
+
+test("pg live channel observations survive older snapshots but yield to later removal", { skip }, async () => {
+  const { directoryObservationCases } = await import("./support/directory-observation-cases.ts");
+  const store = createPostgresDirectoryStore(URL!);
+  await store.replaceChannels([], [], Date.now());
+  const pg = (await import("pg")).default;
+  const pool = new pg.Pool({ connectionString: URL! });
+  await pool.query("UPDATE directory_sync SET channels_synced_at = NULL, channels_hash = NULL");
+  await pool.end();
+  await directoryObservationCases(store);
+});

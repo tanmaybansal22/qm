@@ -1,15 +1,22 @@
 import type { HarnessModelUtilities } from "../../harness/harness.ts";
-import { type MemoryService, ccCaptureToPersonal, isSystemActor } from "../memory-service.ts";
+import {
+  type MemoryService,
+  type MemoryCaptureContext,
+  ccCaptureToPersonal,
+  isSystemActor,
+} from "../memory-service.ts";
 import type { MemoryStrategy } from "../strategy.ts";
 import type { ScopeId } from "../../types.ts";
 import { bullets } from "../notebook.ts";
+import { parseSensitivity, SENSITIVITY_PROMPT } from "../classification.ts";
+import type { MemoryCaptureMetadata } from "../records.ts";
 
 export const DEFAULT_CAPTURE_QUIET_MS = 180_000;
 export const DEFAULT_CAPTURE_MAX_TURNS = 10;
 
 export const MEMORY_EXTRACTION_PROMPT = [
   "You extract durable facts worth remembering about the user across FUTURE conversations.",
-  "Given one or more consecutive exchanges (user message + assistant reply), output ONLY a markdown bullet list",
+  "Given one or more consecutive exchanges (user message + assistant reply), output a markdown bullet list",
   "(`- fact`), one concise standalone fact per line, written in the third person",
   "(e.g. `- Prefers terse replies`, `- Owns the billing service`, `- Working on the Q3 launch`).",
   "Include preferences, identifiers, ongoing projects, and how they like to work.",
@@ -24,14 +31,12 @@ export const MEMORY_EXTRACTION_PROMPT = [
   "the user relies on (a cron, a watcher, an integration), record its EXISTENCE and purpose as",
   'one fact — not its internals. A user-stated convention ("always via the broker, never raw',
   'tokens") is a preference and belongs in memory; how the broker works does not.',
+  "When the user's own message states an instruction, rule, or directive to the assistant about",
+  "how future work should be done, record it VERBATIM as a quoted fact",
+  '(e.g. `- Directive (user\'s words): "always run the linter before pushing"`), not a paraphrase.',
   "If nothing is worth remembering, output exactly: NONE",
-].join("\n");
-
-export const AUTONOMOUS_EXTRACTION_ADDENDUM = [
-  'These exchanges are AUTONOMOUS turns: no human spoke. The "User said" content is a system or',
-  "bot trigger and the reply is the assistant working alone. Record only operational facts",
-  "(state, blockers, queues, outcomes). Output NO preference/intent/instruction facts about any",
-  "person; when only such facts appear, output exactly: NONE",
+  SENSITIVITY_PROMPT,
+  "Prepend exactly SENSITIVITY: <label> on its own first line, classifying the entire extracted list.",
 ].join("\n");
 
 export function parseFacts(out: string): string[] {
@@ -43,32 +48,32 @@ export function parseFacts(out: string): string[] {
 export async function extractFacts(
   harness: HarnessModelUtilities,
   turns: Array<{ input: string; reply: string }>,
-  opts?: { autonomous?: boolean },
-): Promise<string[]> {
-  if (!harness.oneShot) return [];
+): Promise<{ facts: string[]; sensitivity: NonNullable<MemoryCaptureMetadata["sensitivity"]> }> {
+  if (!harness.oneShot) return { facts: [], sensitivity: "unknown" };
   try {
     const transcript = turns.map((t) => `User said:\n${t.input}\n\nAssistant replied:\n${t.reply}`).join("\n\n---\n\n");
-    const system = opts?.autonomous
-      ? `${MEMORY_EXTRACTION_PROMPT}\n\n${AUTONOMOUS_EXTRACTION_ADDENDUM}`
-      : MEMORY_EXTRACTION_PROMPT;
-    const out = await harness.oneShot(system, transcript);
-    return parseFacts(out ?? "");
+    const out = await harness.oneShot(MEMORY_EXTRACTION_PROMPT, transcript);
+    return {
+      facts: parseFacts(out ?? ""),
+      sensitivity: parseSensitivity(/^SENSITIVITY: (ordinary|unknown|sensitive|restricted)\n/.exec(out ?? "")?.[1]),
+    };
   } catch {
-    return [];
+    return { facts: [], sensitivity: "unknown" };
   }
 }
 
-export interface Burst {
+export interface Burst extends MemoryCaptureMetadata {
   scopeId: ScopeId;
   actorId?: string;
-  autonomous?: boolean;
   conversationScopeId: ScopeId;
   conversationLabel?: string;
+  sessionId?: string;
+  idempotencyKey?: string;
   turns: Array<{ input: string; reply: string }>;
   timer?: NodeJS.Timeout;
 }
 
-export type TurnEndCtx = {
+export type TurnEndCtx = MemoryCaptureMetadata & {
   scopeId: ScopeId;
   input: string;
   reply: string;
@@ -76,11 +81,9 @@ export type TurnEndCtx = {
   autonomous?: boolean;
   conversationScopeId?: ScopeId;
   conversationLabel?: string;
+  sessionId?: string;
+  idempotencyKey?: string;
 };
-
-export function isAutonomousBurst(burst: Pick<Burst, "actorId" | "autonomous">): boolean {
-  return burst.autonomous === true || isSystemActor(burst.actorId);
-}
 
 export function createBurstBuffer(
   quietMs: number,
@@ -89,21 +92,37 @@ export function createBurstBuffer(
   onError?: (e: unknown, burst: Burst) => void,
 ): (ctx: TurnEndCtx) => Promise<void> {
   const bursts = new Map<string, Burst>();
-  return async ({ scopeId, input, reply, actorId, autonomous, conversationScopeId, conversationLabel }) => {
+  return async ({
+    scopeId,
+    input,
+    reply,
+    actorId,
+    autonomous,
+    conversationScopeId,
+    conversationLabel,
+    sessionId,
+    idempotencyKey,
+    inheritedRecords,
+  }) => {
+    if (autonomous === true || isSystemActor(actorId)) return;
     const burst: Burst = {
       scopeId,
       conversationScopeId: conversationScopeId ?? scopeId,
       turns: [{ input, reply }],
+      ...(inheritedRecords !== undefined ? { inheritedRecords: structuredClone(inheritedRecords) } : {}),
       ...(actorId !== undefined ? { actorId } : {}),
-      ...(autonomous !== undefined ? { autonomous } : {}),
       ...(conversationLabel !== undefined ? { conversationLabel } : {}),
+      ...(sessionId !== undefined ? { sessionId } : {}),
+      ...(idempotencyKey !== undefined ? { idempotencyKey } : {}),
     };
     if (quietMs <= 0) return flush(burst);
 
-    const key = `${scopeId}\0${burst.conversationScopeId}\0${actorId ?? ""}\0${autonomous ? "auto" : ""}`;
+    const key = `${scopeId}\0${burst.conversationScopeId}\0${actorId ?? ""}\0${sessionId ?? ""}`;
     const pending = bursts.get(key);
     if (pending) {
       pending.turns.push({ input, reply });
+      const unknown = [{ id: "unknown", text: "", sensitivity: "unknown" as const, sources: [], sourceUnknown: true }];
+      pending.inheritedRecords = [...(pending.inheritedRecords ?? unknown), ...(burst.inheritedRecords ?? unknown)];
       clearTimeout(pending.timer);
     } else {
       bursts.set(key, burst);
@@ -122,6 +141,19 @@ export function createBurstBuffer(
   };
 }
 
+export function burstCaptureContext(burst: Burst): MemoryCaptureContext {
+  return {
+    mode: "automatic",
+    ...(burst.inheritedRecords !== undefined ? { inheritedRecords: burst.inheritedRecords } : {}),
+    ...(burst.actorId ? { actorId: burst.actorId } : {}),
+    conversationScopeId: burst.conversationScopeId,
+    input: burst.turns.map((turn) => turn.input).join("\n\n"),
+    reply: burst.turns.map((turn) => turn.reply).join("\n\n"),
+    ...(burst.sessionId ? { sessionId: burst.sessionId } : {}),
+    ...(burst.idempotencyKey ? { idempotencyKey: burst.idempotencyKey } : {}),
+  };
+}
+
 export function createPerTurnStrategy(deps: {
   harness: HarnessModelUtilities;
   memory: MemoryService;
@@ -131,12 +163,10 @@ export function createPerTurnStrategy(deps: {
   onCaptureError?: (e: unknown, scopeId: ScopeId) => void;
 }): MemoryStrategy {
   async function flush(burst: Burst): Promise<void> {
-    const autonomous = isAutonomousBurst(burst);
-    const facts = await extractFacts(deps.harness, burst.turns, { autonomous });
+    const { facts, sensitivity } = await extractFacts(deps.harness, burst.turns);
     if (!facts.length) return;
     const at = Date.now();
-    await deps.memory.capture(burst.scopeId, facts, at);
-    if (autonomous) return;
+    await deps.memory.capture(burst.scopeId, facts, at, burst.actorId, { ...burstCaptureContext(burst), sensitivity });
     await ccCaptureToPersonal(
       deps.memory,
       burst.conversationScopeId,
@@ -144,6 +174,11 @@ export function createPerTurnStrategy(deps: {
       facts,
       at,
       burst.conversationLabel,
+      {
+        ...burstCaptureContext(burst),
+        sensitivity,
+        ...(burst.idempotencyKey ? { idempotencyKey: `${burst.idempotencyKey}:personal` } : {}),
+      },
     );
   }
 

@@ -73,6 +73,8 @@ describe("canAdminister: owner checks are same-person, not raw id equality", () 
     return {
       membershipControlsScope: async () => false,
       managesScope: async () => false,
+      isCurrentSharedScopeMember: async () => false,
+      isOpenScopeMember: async () => false,
       samePerson: (a: string, b: string) => samePersonInDirectory(dir, a, b),
     };
   }
@@ -97,9 +99,13 @@ describe("canAdminister: owner checks are same-person, not raw id equality", () 
   });
 
   it("webhooks share the same owner rule", async () => {
-    const webhook = { id: "w1", owner: "Regan@YC.com", ownerScopeId: scopeId("personal", "Regan@YC.com") } as Webhook;
-    assert.equal(await canAdministerWebhook(appOver(), webhook, "regan@yc.com"), true);
-    assert.equal(await canAdministerWebhook(appOver(), webhook, "casey@yc.com"), false);
+    const webhook = {
+      id: "w1",
+      owner: "Alex@EXAMPLE.com",
+      ownerScopeId: scopeId("personal", "Alex@EXAMPLE.com"),
+    } as Webhook;
+    assert.equal(await canAdministerWebhook(appOver(), webhook, "alex@example.com"), true);
+    assert.equal(await canAdministerWebhook(appOver(), webhook, "casey@example.com"), false);
   });
 
   it("the list-path matcher agrees with the per-item check, including the roster bridge", async () => {
@@ -174,14 +180,20 @@ describe("resolveRunAsChange: the owner gate is same-person, not raw id equality
     await dir.replace([
       { principalId: "jordan@acme.test", displayName: "Jordan", type: "internal", slackId: "U-jordan" },
     ]);
-    const app = { samePerson: (a: string, b: string) => samePersonInDirectory(dir, a, b) };
+    const app = {
+      isOpenScopeMember: async () => false,
+      samePerson: (a: string, b: string) => samePersonInDirectory(dir, a, b),
+    };
     const r = await resolveRunAsChange(app, shared(), "owner", capability);
     assert.equal(r.ok, true);
     if (r.ok) assert.equal(r.patch.runAs, "owner");
   });
 
   it("without the roster the bridge fails closed — forbidden", async () => {
-    const app = { samePerson: (a: string, b: string) => samePersonInDirectory(createDirectoryStore(), a, b) };
+    const app = {
+      isOpenScopeMember: async () => false,
+      samePerson: (a: string, b: string) => samePersonInDirectory(createDirectoryStore(), a, b),
+    };
     const r = await resolveRunAsChange(app, shared(), "owner", capability);
     assert.equal(r.ok, false);
     if (!r.ok) assert.equal(r.code, "forbidden");

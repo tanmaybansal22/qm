@@ -18,7 +18,19 @@ export interface CreateWebhookInput extends CreateTriggerInput {
   filters?: Webhook["filters"];
 }
 
+export interface WebhookEvent {
+  deliveryId: string;
+  receivedAt: number;
+  payload: string;
+}
+
+export interface WebhookHistory {
+  events: WebhookEvent[];
+}
+
 export interface WebhookStore {
+  recordEvent(id: string, event: WebhookEvent): Promise<void>;
+  listEvents(id: string): Promise<WebhookEvent[]>;
   create(input: CreateWebhookInput): Promise<Webhook>;
   get(id: string): Promise<Webhook | null>;
   list(): Promise<Webhook[]>;
@@ -27,8 +39,33 @@ export interface WebhookStore {
   recordFire(id: string, info: { at: number; deliveryId?: string; error?: string }): Promise<void>;
 }
 
-export function createWebhookStore(backing: DurableMap<Webhook> = createMemoryMap<Webhook>()): WebhookStore {
+export function createWebhookStore(
+  backing: DurableMap<Webhook> = createMemoryMap<Webhook>(),
+  history: DurableMap<WebhookHistory> = createMemoryMap<WebhookHistory>(),
+): WebhookStore {
+  if (!history.update) throw new Error("webhook history requires atomic updates");
+  const updateHistory = history.update.bind(history);
   return {
+    async recordEvent(id, event) {
+      await history.putIfAbsent(id, { events: [] });
+      await updateHistory(id, (value) => {
+        if (value.events.some((e) => e.deliveryId === event.deliveryId)) return value;
+        return {
+          events: [
+            ...value.events,
+            {
+              ...event,
+              payload: event.payload.slice(0, 16_100),
+            },
+          ]
+            .sort((a, b) => b.receivedAt - a.receivedAt || a.deliveryId.localeCompare(b.deliveryId))
+            .slice(0, 50),
+        };
+      });
+    },
+    async listEvents(id) {
+      return structuredClone((await history.get(id))?.events ?? []);
+    },
     async create(input) {
       assertNoEscalation(input);
       if (!getVerifier(input.verification.scheme) || !input.verification.secret) {
@@ -76,22 +113,4 @@ export function createWebhookStore(backing: DurableMap<Webhook> = createMemoryMa
       });
     },
   };
-}
-
-export async function disableLegacyWebhookRows(pg: {
-  q(text: string, params?: unknown[]): Promise<unknown[]>;
-}): Promise<void> {
-  const sweepId = "durable-map/webhooks/0002-disable-rows-orphaned-by-webhook-removal";
-  await pg.q(
-    "CREATE TABLE IF NOT EXISTS schema_migrations (id TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-  );
-  const claimed = await pg.q(
-    "INSERT INTO schema_migrations (id) VALUES ($1) ON CONFLICT (id) DO NOTHING RETURNING id",
-    [sweepId],
-  );
-  if (claimed.length === 0) return;
-  await pg.q("CREATE TABLE IF NOT EXISTS webhooks (id TEXT PRIMARY KEY, json JSONB NOT NULL)");
-  await pg.q(
-    "UPDATE webhooks SET json = jsonb_set(json, '{enabled}', 'false'::jsonb) WHERE (json ->> 'enabled')::boolean",
-  );
 }

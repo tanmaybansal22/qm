@@ -91,9 +91,11 @@ export function probeIdentityMode(members: SlackUser[], ownTeamId: string): Slac
 }
 
 export interface ChannelMeta {
+  is_im?: boolean;
   name?: string;
   is_ext_shared?: boolean;
   is_pending_ext_shared?: boolean;
+  is_member?: boolean;
   is_mpim?: boolean;
   is_private?: boolean;
   purpose?: { value?: string };
@@ -175,7 +177,7 @@ export function internalChannelMembers(members: ActorAssertion[], complete: bool
 export async function resolveChannelMembership(opts: {
   memberIds: readonly string[];
   actor: ActorAssertion;
-  actorSlackId: string;
+  actorSlackId: string | undefined;
   info: ChannelMeta | undefined;
   classify(id: string): Promise<{ actor: ActorAssertion; ok: boolean }>;
 }): Promise<{
@@ -184,7 +186,8 @@ export async function resolveChannelMembership(opts: {
   slackIdsByPrincipal?: Map<string, string>;
 }> {
   const { memberIds, actor, info } = opts;
-  if (!actor.isBot && !memberIds.includes(opts.actorSlackId)) return { audience: [actor, externalMarker()] };
+  if (!actor.isBot && (opts.actorSlackId === undefined || !memberIds.includes(opts.actorSlackId)))
+    return { audience: [actor, externalMarker()] };
 
   const members: ActorAssertion[] = [];
   const slackIdsByPrincipal = new Map<string, string>();

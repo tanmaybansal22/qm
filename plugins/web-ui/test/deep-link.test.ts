@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { deepLinkPath, parseDeepLink, sessionLink } from "../src/deep-link.ts";
+import { deepLinkPath, parseDeepLink, sessionLink, sessionLinkTarget } from "../src/deep-link.ts";
 
 test("chats view with an active session is addressed by /s/<id>", () => {
   assert.equal(deepLinkPath("", "chats", "abc-123"), "/s/abc-123");
@@ -24,6 +24,7 @@ test("non-chat views are path-addressed regardless of any session", () => {
   assert.equal(deepLinkPath("", "webhooks", null), "/webhooks");
   assert.equal(deepLinkPath("", "files", "abc"), "/files");
   assert.equal(deepLinkPath("", "keychain", null), "/keychain");
+  assert.equal(deepLinkPath("", "deploys", null), "/apps");
 });
 
 test("the contexts view carries its open scope", () => {
@@ -43,15 +44,26 @@ test("session ids are URI-encoded", () => {
 test("parseDeepLink reads the view from the path", () => {
   assert.deepEqual(parseDeepLink("", "/webhooks", ""), { view: "webhooks", session: null, item: null });
   assert.deepEqual(parseDeepLink("", "/crons", ""), { view: "crons", session: null, item: null });
+  assert.deepEqual(parseDeepLink("", "/apps", ""), { view: "deploys", session: null, item: null });
   assert.deepEqual(parseDeepLink("/web-ui/", "/web-ui/crons", ""), { view: "crons", session: null, item: null });
   assert.deepEqual(parseDeepLink("", "/", "?session=s1"), { view: null, session: "s1", item: null });
 });
 
+test("legacy deploys links resolve to Apps while new links use /apps", () => {
+  assert.deepEqual(parseDeepLink("", "/deploys", ""), { view: "deploys", session: null, item: null });
+  assert.deepEqual(parseDeepLink("/web-ui/", "/web-ui/apps", ""), {
+    view: "deploys",
+    session: null,
+    item: null,
+  });
+  assert.deepEqual(parseDeepLink("", "/", "?view=apps"), { view: "deploys", session: null, item: null });
+});
+
 test("project paths open the contexts view with a resolvable project identifier", () => {
-  assert.deepEqual(parseDeepLink("", "/projects/atlas", ""), {
+  assert.deepEqual(parseDeepLink("", "/projects/alice", ""), {
     view: "contexts",
     session: null,
-    item: "atlas",
+    item: "alice",
   });
   assert.deepEqual(parseDeepLink("/web-ui/", "/web-ui/projects/channel/C0123", ""), {
     view: "contexts",
@@ -106,4 +118,43 @@ test("only the first two path segments are addressed", () => {
 test("sessionLink builds an absolute link under the serving base", () => {
   assert.equal(sessionLink("https://portal.example", "/web-ui/", "s1"), "https://portal.example/web-ui/s/s1");
   assert.equal(sessionLink("http://localhost:8096", "", "s1"), "http://localhost:8096/s/s1");
+});
+
+test("/c/<id> is accepted as an alias for /s/<id> (links shared from Slack)", () => {
+  assert.deepEqual(parseDeepLink("", "/c/abc-123", ""), { view: "chats", session: "abc-123", item: null });
+  assert.deepEqual(parseDeepLink("/web-ui", "/web-ui/c/abc-123", ""), {
+    view: "chats",
+    session: "abc-123",
+    item: null,
+  });
+});
+
+test("sent and pending email URLs use the same id route shape", () => {
+  for (const base of ["", "/web-ui"]) {
+    const path = deepLinkPath(base, "inbox", null, null, "96e58b52e75bf97f");
+    assert.equal(path, `${base}/inbox/96e58b52e75bf97f`);
+    assert.deepEqual(parseDeepLink(base, path, ""), {
+      view: "inbox",
+      session: null,
+      item: "96e58b52e75bf97f",
+    });
+  }
+});
+
+test("in-app session links resolve to the session and optional message seq", () => {
+  const origin = "https://qm.example.com";
+  assert.deepEqual(sessionLinkTarget(`${origin}/s/abc`, origin, ""), { session: "abc", seq: null });
+  assert.deepEqual(sessionLinkTarget(`${origin}/s/abc?seq=12`, origin, ""), { session: "abc", seq: 12 });
+  assert.deepEqual(sessionLinkTarget("/ui/s/abc", origin, "/ui"), { session: "abc", seq: null });
+  assert.deepEqual(sessionLinkTarget(`${origin}/c/abc`, origin, ""), { session: "abc", seq: null });
+  assert.deepEqual(sessionLinkTarget(`${origin}/s/abc?seq=abc`, origin, ""), { session: "abc", seq: null });
+});
+
+test("other links are not treated as session links", () => {
+  const origin = "https://qm.example.com";
+  assert.equal(sessionLinkTarget("https://elsewhere.example.com/s/abc", origin, ""), null);
+  assert.equal(sessionLinkTarget(`${origin}/d/my-app/`, origin, ""), null);
+  assert.equal(sessionLinkTarget(`${origin}/apps`, origin, ""), null);
+  assert.equal(sessionLinkTarget(`${origin}/s/abc`, origin, "/ui"), null);
+  assert.equal(sessionLinkTarget("not a url", "null", ""), null);
 });

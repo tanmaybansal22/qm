@@ -199,7 +199,7 @@ test("lossy scope names cannot share a local workspace directory", async () => {
   assert.notEqual(ws.scopeDir(scopeId("channel", "a/b")), ws.scopeDir(scopeId("channel", "a?b")));
 });
 
-test("'* fact' bullets participate in capture dedupe, the facts cap, and query()", async () => {
+test("'* fact' bullets participate in capture dedupe and query(); capture never evicts old facts", async () => {
   const ws = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-star-")));
   const mem = createMemoryService(ws);
   const sid = scopeId("personal", "U1");
@@ -215,8 +215,8 @@ test("'* fact' bullets participate in capture dedupe, the facts cap, and query()
   assert.equal(await mem.capture(sid, ["Lives in Seattle"], at), 1);
   const after = await mem.read(sid);
   assert.match(after, /- \(2026-05-31\) Lives in Seattle/, "the new fact is appended");
-  assert.doesNotMatch(after, /star fact 0\n/, "'* ' bullets count toward the cap — the oldest was dropped");
-  assert.match(after, /star fact 1\n/, "only the overflow was dropped");
+  assert.match(after, /star fact 0\n/, "the oldest fact survives — capture never drops");
+  assert.match(after, /star fact 1\n/);
 });
 
 test("query() retrieves matching facts and is scope-keyed (boundary-safe)", async () => {
@@ -233,4 +233,67 @@ test("query() retrieves matching facts and is scope-keyed (boundary-safe)", asyn
   assert.deepEqual(hits, ["(2026-05-31) Owns the billing service"]);
   assert.deepEqual(await mem.query(personal, "kubernetes"), []);
   assert.deepEqual(await mem.query(channel, "handle"), []);
+});
+
+test("file memory: legacy Markdown migrates lazily into one canonical records file", async () => {
+  const ws = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-mig-")));
+  const sid = scopeId("personal", "U1");
+  await ws.ensureScope(sid);
+  await ws.write(sid, MEMORY_FILE, "# Memory\n\n- Prefers terse replies\n");
+  const mem = createMemoryService(ws);
+  const head = await mem.readHead!(sid);
+  assert.equal(head.content, "# Memory\n\n- Prefers terse replies\n");
+  assert.equal(head.records!.records[1]!.sourceUnknown, true);
+  assert.equal(await ws.read(sid, MEMORY_FILE), "# Memory\n\n- Prefers terse replies\n");
+  assert.equal(await mem.capture(sid, ["Owns billing"], Date.UTC(2026, 0, 2), undefined, { mode: "explicit" }), 1);
+  const stored = JSON.parse((await ws.read(sid, MEMORY_FILE))!);
+  assert.equal(stored.version, 1);
+  const reopened = createMemoryService(ws);
+  assert.match(await reopened.read(sid), /Prefers terse replies\n- \(2026-01-02\) Owns billing\n$/);
+  assert.equal((await reopened.readHead!(sid)).records!.records.length, 3);
+});
+
+test("file memory: malformed canonical records fail closed", async () => {
+  const ws = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-bad-")));
+  const sid = scopeId("personal", "U1");
+  await ws.ensureScope(sid);
+  await ws.write(sid, MEMORY_FILE, '{"version":1,"records":[');
+  const mem = createMemoryService(ws);
+  await assert.rejects(mem.read(sid), /Malformed memory records/);
+  await ws.write(sid, MEMORY_FILE, '{"version":2,"records":[]}');
+  await assert.rejects(mem.recall(sid), /Invalid memory records/);
+});
+
+test("file memory: duplicate capture tightens metadata without adding a bullet", async () => {
+  const ws = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-dup-")));
+  const sid = scopeId("personal", "U1");
+  await ws.ensureScope(sid);
+  const mem = createMemoryService(ws);
+  const at = Date.UTC(2026, 0, 2);
+  await mem.capture(sid, ["Salary band is L5"], at, undefined, { mode: "explicit", inheritedRecords: [] });
+  assert.equal(
+    await mem.capture(sid, ["Salary band is L5"], at, undefined, { mode: "explicit", sensitivity: "restricted" }),
+    0,
+  );
+  const bullet = (await mem.readHead!(sid)).records!.records.find((r) => r.text.includes("Salary"))!;
+  assert.equal(bullet.sensitivity, "restricted");
+  assert.equal((await mem.read(sid)).split("Salary").length, 2);
+});
+
+test("file memory: replaceRecordsIfRevision is revision-guarded and validates the snapshot", async () => {
+  const ws = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-cas-")));
+  const sid = scopeId("personal", "U1");
+  await ws.ensureScope(sid);
+  const mem = createMemoryService(ws);
+  await mem.capture(sid, ["Alpha fact"], Date.UTC(2026, 0, 2), undefined, { mode: "explicit" });
+  const head = await mem.readHead!(sid);
+  const next = { ...head.records!, records: head.records!.records.filter((r) => !r.text.startsWith("#")) };
+  await assert.rejects(
+    mem.replaceRecordsIfRevision!(sid, { version: 1, records: [{ id: "" }] } as never, head.revision),
+    /Invalid memory records/,
+  );
+  assert.equal(await mem.replaceRecordsIfRevision!(sid, next, head.revision), true);
+  assert.equal(await mem.replaceRecordsIfRevision!(sid, next, head.revision), false);
+  assert.equal(await mem.read(sid), "- (2026-01-02) Alpha fact\n");
+  assert.deepEqual((await mem.readHead!(sid)).records!.records[0]!.id, next.records[0]!.id);
 });

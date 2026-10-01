@@ -4,7 +4,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createToolContext } from "../src/tools/primitives.ts";
-import { createPiTools, type ToolContextRef } from "../src/harness/pi-tools.ts";
+import { createAgentTools, type ToolContextRef } from "../src/harness/agent-tools.ts";
 import { createLocalWorkspaceStore } from "../src/workspace/workspace-store.ts";
 import { createMemoryService } from "../src/memory/memory-service.ts";
 import { scopeId, type ScopeId, type WorkspaceLayer } from "../src/types.ts";
@@ -110,13 +110,13 @@ test("memoryRemember/memoryRead/memoryRewrite hit the durable MemoryService, att
 });
 
 type Emitted = { type: string; payload: any; scopeLabel: string };
-const call = (tool: ReturnType<typeof createPiTools>[number] | undefined, params: unknown) => {
+const call = (tool: ReturnType<typeof createAgentTools>[number] | undefined, params: unknown) => {
   assert.ok(tool);
   return (tool.execute as unknown as (id: string, p: unknown) => Promise<unknown>)("t", params);
 };
 const textOf = (r: unknown): string => (r as { content: Array<{ text: string }> }).content[0]?.text ?? "";
 
-test("createPiTools exposes ONE `memory` tool: search returns scope-keyed hits + emits a trace", async () => {
+test("createAgentTools exposes ONE `memory` tool: search returns scope-keyed hits + emits a trace", async () => {
   const workspace = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "ws-recall-pi-")));
   const memory = createMemoryService(workspace);
   const personal = scopeId("personal", "U1");
@@ -131,7 +131,7 @@ test("createPiTools exposes ONE `memory` tool: search returns scope-keyed hits +
     },
     scopeLabel: personal,
   };
-  const tools = createPiTools(ref);
+  const tools = createAgentTools(ref);
   assert.equal(
     tools.some((t) => t.name === "recall"),
     false,
@@ -168,7 +168,7 @@ test("the `memory` tool remember/read/rewrite round-trip through the durable ser
     emit: () => {},
     scopeLabel: personal,
   };
-  const memoryTool = createPiTools(ref).find((t) => t.name === "memory");
+  const memoryTool = createAgentTools(ref).find((t) => t.name === "memory");
 
   assert.match(
     textOf(await call(memoryTool, { action: "remember", facts: ["Ships on Fridays"] })),
@@ -201,7 +201,7 @@ test("a read-only wake keeps `memory` but refuses its write actions", async () =
     emit: () => {},
     scopeLabel: personal,
   };
-  const memoryTool = createPiTools(ref, { readOnly: true }).find((t) => t.name === "memory");
+  const memoryTool = createAgentTools(ref, { readOnly: true }).find((t) => t.name === "memory");
 
   assert.match(textOf(await call(memoryTool, { action: "search", query: "billing" })), /billing service/);
   assert.match(textOf(await call(memoryTool, { action: "read" })), /billing service/);
@@ -211,7 +211,7 @@ test("a read-only wake keeps `memory` but refuses its write actions", async () =
 });
 
 test("the `memory` tool params expose NO scope field — the model cannot redirect the notebook", () => {
-  const memoryTool = createPiTools({ current: null }).find((t) => t.name === "memory");
+  const memoryTool = createAgentTools({ current: null }).find((t) => t.name === "memory");
   assert.ok(memoryTool);
   const props = (memoryTool.parameters as { properties?: Record<string, unknown> }).properties ?? {};
   assert.deepEqual(Object.keys(props).sort(), ["action", "content", "facts", "limit", "query"]);
@@ -279,4 +279,18 @@ test("memorySearch spans every readable notebook, tagging hits when more than on
     `[${personal}] (2026-05-31) deploys happen on Fridays`,
     `[${org}] (2026-05-31) deploys are frozen in December`,
   ]);
+});
+
+test("explicit capture uses the conversation origin rather than the notebook destination", async () => {
+  const workspace = createLocalWorkspaceStore(mkdtempSync(join(tmpdir(), "memory-origin-")));
+  const memory = createMemoryService(workspace);
+  const capture = memory.capture;
+  let context: Parameters<typeof capture>[4];
+  memory.capture = async (scope, facts, at, author, metadata) => {
+    context = metadata;
+    return capture(scope, facts, at, author, metadata);
+  };
+  const tool = ctxFor({ scope: "group:origin", memoryScopeId: "personal:alice", workspace, memory });
+  assert.equal(await tool.memoryRemember(["synthetic fact"]), 1);
+  assert.equal(context?.conversationScopeId, "group:origin");
 });

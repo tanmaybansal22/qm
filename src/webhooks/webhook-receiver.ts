@@ -2,8 +2,8 @@ import type { Destination, Webhook } from "../types.ts";
 import type { WebhookStore } from "./webhook-store.ts";
 import { getVerifier, type VerifierInput } from "./verifiers.ts";
 import { runTrigger, type TriggerDeps } from "../triggers/run-trigger.ts";
-import { buildWebhookWakeEnvelope } from "../core/wake-envelope.ts";
-import { errMessage } from "../util/errors.ts";
+import { buildWebhookWakeEnvelope, capForEscaping } from "../core/wake-envelope.ts";
+import { errMessage, reportFailure } from "../util/errors.ts";
 
 export type DeliverResult = { status: 202 } | { status: 200; body: string } | { status: 401 } | { status: 404 };
 
@@ -53,7 +53,8 @@ function renderEvent(
   rawBody: string,
 ): { input: string; securityScreenData: string } {
   const pretty = isObj(parsed) || Array.isArray(parsed) ? JSON.stringify(parsed, null, 2) : rawBody;
-  const capped = pretty.length > MAX_EVENT_CHARS ? `${pretty.slice(0, MAX_EVENT_CHARS)}\n…[truncated]` : pretty;
+  const kept = capForEscaping(pretty, MAX_EVENT_CHARS, "head");
+  const capped = kept.length < pretty.length ? `${kept}\n…[truncated]` : kept;
   return {
     input: buildWebhookWakeEnvelope({
       webhookId: wh.id,
@@ -105,6 +106,11 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
 
       const event = renderEvent(wh, deliveryId, parsed, req.rawBody);
       const destination: Destination | undefined = wh.destination;
+      await deps.webhooks.recordEvent(wh.id, {
+        deliveryId,
+        receivedAt: Date.now(),
+        payload: event.securityScreenData,
+      });
 
       void runTrigger(triggerDeps, {
         owner: wh.owner,
@@ -133,7 +139,7 @@ export function createWebhookReceiver(deps: WebhookReceiverDeps): WebhookReceive
         .catch((e: unknown) => {
           const msg = errMessage(e);
           void deps.webhooks.recordFire(wh.id, { at: Date.now(), error: msg });
-          console.error(`[webhook] ${wh.id} turn threw: ${msg}`);
+          reportFailure("webhook: fire", e, `webhook=${wh.id}`);
         });
 
       return { status: 202 };

@@ -1,7 +1,10 @@
+import { sessionStatusMark } from "./session-status.ts";
+import type { CoreSession } from "./core-bridge.ts";
 import { html, nothing, type TemplateResult } from "lit";
-import { Box, Brain, Clock3, Files, GitFork, KeyRound, Rocket } from "lucide";
+import { ArrowUpLeft, Box, Brain, Clock3, Ellipsis, Files, GitFork, KeyRound, Rocket } from "lucide";
 import { api } from "./core-bridge";
-import { icon } from "./ui";
+import { closeFormMenus, icon, toggleFormMenu } from "./ui";
+import { tip } from "./tooltip";
 
 /** A session's context carried into the crons/files/memory views so the whole
  * view stays scoped to that project and keeps the session top bar. */
@@ -41,11 +44,6 @@ const TOOL_COUNTERS: Partial<Record<SessionTool, (scope: string) => Promise<numb
     }
     return count;
   },
-  files: async (scope) => {
-    const q = new URLSearchParams({ limit: "100", scope });
-    const r = await api<{ owned?: unknown[]; shared?: unknown[] }>(`/api/files?${q.toString()}`);
-    return (r.owned?.length ?? 0) + (r.shared?.length ?? 0);
-  },
   apps: async (scope) => {
     const r = await api<{ deployments?: Array<{ status?: string; ownerScopeId?: string; createdInScope?: string }> }>(
       "/api/deployments",
@@ -53,10 +51,6 @@ const TOOL_COUNTERS: Partial<Record<SessionTool, (scope: string) => Promise<numb
     return (r.deployments ?? []).filter(
       (d) => d.status !== "archived" && (d.createdInScope === scope || d.ownerScopeId === scope),
     ).length;
-  },
-  skills: async (scope) => {
-    const r = await api<{ skills?: Array<{ scopeId?: string; status?: string }> }>("/api/skills?includeShadowed=1");
-    return (r.skills ?? []).filter((sk) => sk.scopeId === scope && sk.status !== "archived").length;
   },
 };
 
@@ -84,10 +78,13 @@ export function scopeToolCount(tool: SessionTool, scope: string, onReady: () => 
 export type SessionTool = "crons" | "files" | "memory" | "apps" | "skills" | "keychain";
 
 export interface SessionTopbarOpts {
+  status?: CoreSession["status"];
+  sessionId?: string | null;
   crumb: string | null;
   title: string;
   activeTool?: SessionTool | null;
   toolCount?: ((tool: SessionTool) => number | null) | null;
+  parent?: { title: string; onClick: () => void } | null;
   fork?: { title: string; onClick?: (() => void) | null } | null;
   onTitle?: (() => void) | null;
   onCrumb?: (() => void) | null;
@@ -101,7 +98,7 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
     return html`<button
         class="session-crumb as-link"
         type="button"
-        title="Open the ${o.crumb} project"
+        ${tip(`Open the ${o.crumb} project`)}
         @click=${(e: Event) => {
           e.stopPropagation();
           o.onCrumb!();
@@ -111,14 +108,13 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
       ><span class="session-crumb-sep">/</span>`;
   })();
   const heading = html`
-    ${crumbTpl}
-    <span class="session-title">${o.title}</span>
+    ${crumbTpl} ${o.title ? html`<span class="session-title" dir="auto">${o.title}</span>` : nothing}
     ${
       o.fork
         ? html`<button
             class="session-fork-badge"
             type="button"
-            title="Forked from ${o.fork.title}${o.fork.onClick ? " — open the original" : ""}"
+            ${tip(`Forked from ${o.fork.title}${o.fork.onClick ? ". Open the original" : ""}`)}
             ?disabled=${!o.fork.onClick}
             @click=${(e: Event) => {
               e.stopPropagation();
@@ -130,36 +126,84 @@ export function sessionTopbarTpl(o: SessionTopbarOpts): TemplateResult {
         : nothing
     }
   `;
-  const headingTitle = o.crumb
-    ? `This chat runs in the ${o.crumb} context — the agent works with that context's files and memory, separate from your personal context.`
-    : o.title;
   const tool = (t: SessionTool, glyph: Parameters<typeof icon>[0], hint: string) => {
-    const count = o.toolCount?.(t) ?? null;
+    const count = t === "crons" || t === "apps" ? (o.toolCount?.(t) ?? null) : null;
     return html`
       <button
         class="session-tool ${o.activeTool === t ? "active" : ""}"
         type="button"
         aria-label=${hint}
+        ${tip(hint)}
         @click=${() => o.onTool(t)}
       >
         ${icon(glyph, 15)}${count ? html`<span class="session-tool-count">${count}</span>` : nothing}
-        <span class="session-tool-hint" role="tooltip">${hint}</span>
+      </button>
+    `;
+  };
+  const sheetTool = (t: SessionTool, glyph: Parameters<typeof icon>[0], hint: string) => {
+    const count = t === "crons" || t === "apps" ? (o.toolCount?.(t) ?? null) : null;
+    return html`
+      <button
+        class="menu-option ${o.activeTool === t ? "active" : ""}"
+        type="button"
+        role="menuitem"
+        @click=${() => {
+          closeFormMenus();
+          o.onTool(t);
+        }}
+      >
+        ${icon(glyph, 17)}
+        <span class="menu-option-copy"><span class="menu-option-label">${hint}</span></span>
+        ${count ? html`<span class="session-tool-count">${count}</span>` : nothing}
       </button>
     `;
   };
   return html`
     <header class="chat-topbar session-topbar">
       ${
+        o.parent
+          ? html`<button
+                class="session-parent-link"
+                type="button"
+                aria-label=${`Back to parent: ${o.parent.title}`}
+                ${tip(`Back to ${o.parent.title}`)}
+                @click=${o.parent.onClick}
+              >
+                ${icon(ArrowUpLeft, 15)}<span>${o.parent.title}</span>
+              </button>
+              <span class="session-crumb-sep" aria-hidden="true">/</span>`
+          : nothing
+      }
+      ${
         o.onTitle
-          ? html`<button class="session-heading as-link" type="button" title="Back to this chat" @click=${o.onTitle}>
+          ? html`<button class="session-heading as-link" type="button" ${tip("Back to this chat")} @click=${o.onTitle}>
               ${heading}
             </button>`
-          : html`<div class="session-heading" title=${headingTitle}>${heading}</div>`
+          : html`<div class="session-heading">${heading}</div>`
       }
+      ${sessionStatusMark(o.status)}
       <div class="topbar-actions session-tools">
-        ${tool("crons", Clock3, "Crons")} ${tool("files", Files, "Files")} ${tool("apps", Rocket, "Apps")}
+        ${tool("crons", Clock3, "Crons")} ${tool("apps", Rocket, "Apps")} ${tool("files", Files, "Files")}
         ${tool("skills", Box, "Skills")} ${tool("memory", Brain, "Memory")}
         ${tool("keychain", KeyRound, "Your keychain")}
+      </div>
+      <div class="topbar-actions form-menu-control session-tools-more" data-align="right" data-drop="down">
+        <button
+          class="icon-btn menu-button session-tools-more-btn"
+          type="button"
+          aria-label="Session tools"
+          aria-haspopup="menu"
+          aria-expanded="false"
+          @click=${toggleFormMenu}
+        >
+          ${icon(Ellipsis, 20)}
+        </button>
+        <div class="menu-popover" role="menu" hidden>
+          <div class="menu-title">This conversation's workspace</div>
+          ${sheetTool("crons", Clock3, "Crons")} ${sheetTool("apps", Rocket, "Apps")}
+          ${sheetTool("files", Files, "Files")} ${sheetTool("skills", Box, "Skills")}
+          ${sheetTool("memory", Brain, "Memory")} ${sheetTool("keychain", KeyRound, "Your keychain")}
+        </div>
       </div>
     </header>
   `;
@@ -176,6 +220,7 @@ export function scopedViewTopbar(current: SessionTool, redraw: () => void): Temp
   const active = scopedSession.active;
   if (!active) return nothing;
   return sessionTopbarTpl({
+    sessionId: active.sessionId,
     crumb: active.crumb,
     title: active.title,
     onCrumb: active.crumb ? () => openProjectPage(active.scopeId) : null,

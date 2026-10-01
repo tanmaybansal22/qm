@@ -12,20 +12,13 @@ const fn = (src: string, name: string): string => {
   return body;
 };
 
-test("a tab offers an archive button beside close, for real sessions only", () => {
-  const btn = split.match(/this\.inStrip && sessionId[\s\S]*?split-tab-archive[\s\S]*?<\/button>`/)?.[0] ?? "";
-  assert.ok(btn, "archive button must render only in the tab strip and only when the pane shows a session");
-  assert.match(btn, /archiveSessionById\(sessionId\)/, "click archives the pane's session");
-  assert.match(btn, /e\.stopPropagation\(\)/, "click must not also activate the tab");
-  assert.match(
-    btn,
-    /@pointerdown=\$\{\(e: Event\) => e\.stopPropagation\(\)\}/,
-    "pointerdown must not activate an inactive tab before the archive click lands",
-  );
-  assert.ok(
-    split.indexOf("split-tab-archive") < split.indexOf('title="Close pane"'),
-    "archive sits before (next to) the close button",
-  );
+test("a tab archives its own session through the shared action list", () => {
+  const tab = split.slice(split.indexOf("class PaneTab"), split.indexOf("class StripDrop"));
+  assert.match(tab, /split-tab-actions[\s\S]*?tip\("Close pane"\)/);
+  assert.match(tab, /split-tab-session/);
+  assert.doesNotMatch(tab, /archiveSessionById/);
+  const items = fn(split, "sessionActionItems");
+  assert.match(items, /split-tab-archive[\s\S]*?archiveSessionById\(sessionId\)/);
 });
 
 test("archiveSessionById routes through setArchived so surfaces close and Recents updates at once", () => {
@@ -41,12 +34,10 @@ test("archiveSessionById routes through setArchived so surfaces close and Recent
   );
 });
 
-test("a lone tab keeps its archive button even though its close yields to the group header", () => {
-  const css = readFileSync(new URL("../src/shell.css", import.meta.url), "utf8");
-  const hide = css.indexOf(".dv-single-tab .split-tab-close");
-  const keep = css.indexOf(".dv-single-tab .split-tab-archive");
-  assert.ok(hide !== -1 && keep !== -1, "both single-tab rules exist");
-  assert.ok(keep > hide, "the archive exemption must come after (and defeat) the hide rule");
-  const rule = css.slice(keep, css.indexOf("}", keep));
-  assert.match(rule, /display: inline-flex/);
+test("archive lives in the header only while the tab is alone; tabs take it over", () => {
+  const css = read("shell.css");
+  assert.match(css, /\.dv-single-tab \.split-tab-actions\s*\{\s*display: none/);
+  assert.match(css, /\.split-group-session-action\s*\{\s*display: inline-flex/);
+  assert.match(css, /:not\(\.dv-single-tab\) \.split-group-session-action \{\s*display: none;/);
+  assert.match(split, /sessionId \? sessionActions\(sessionId, panel!\.id, "split-group-session-action"\) : nothing/);
 });

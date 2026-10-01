@@ -1,11 +1,33 @@
+import { isObj } from "../util/objects.ts";
 import { LRUCache } from "lru-cache";
+
+export const SLACK_STATUS_TASK_PREFIX = "qm_status:";
+
+export function isOwnStatusCard(
+  message: { user?: string; bot_id?: string; blocks?: unknown[] },
+  botUserId: string,
+  ownBotId = "",
+): boolean {
+  const own = (botUserId && message.user === botUserId) || (ownBotId && message.bot_id === ownBotId);
+  return Boolean(
+    own &&
+    Array.isArray(message.blocks) &&
+    message.blocks.some(
+      (block) =>
+        isObj(block) &&
+        block.type === "task_card" &&
+        typeof block.task_id === "string" &&
+        block.task_id.startsWith(SLACK_STATUS_TASK_PREFIX),
+    ),
+  );
+}
 
 export function mentionsBot(text: string, botUserId: string): boolean {
   return botUserId ? text.includes(`<@${botUserId}>`) : false;
 }
 
 export function threadHasBotStake(
-  messages: readonly { user?: string; bot_id?: string; text?: string }[],
+  messages: readonly { user?: string; bot_id?: string; text?: string; mentionsSelf?: boolean }[],
   botUserId: string,
   ownBotId = "",
 ): boolean {
@@ -15,6 +37,7 @@ export function threadHasBotStake(
     const bot = m.bot_id ? String(m.bot_id) : "";
     const text = m.text ? String(m.text) : "";
     return Boolean(
+      m.mentionsSelf ||
       (botUserId && user === botUserId) ||
       (ownBotId && bot === ownBotId) ||
       (botUserId && mentionsBot(text, botUserId)),
@@ -32,6 +55,14 @@ export function shouldProcessMessage(
   if (m.subtype && m.subtype !== "file_share" && m.subtype !== "thread_broadcast" && m.subtype !== "bot_message")
     return false;
   return true;
+}
+
+export function shouldMirrorMessage(m: { hidden?: boolean; subtype?: string; ts?: string }): boolean {
+  return (
+    Boolean(m.ts) &&
+    m.hidden !== true &&
+    !["message_changed", "message_deleted", "message_replied", "tombstone"].includes(m.subtype ?? "")
+  );
 }
 
 export function isGroupMembershipMessage(m: { channel_type?: string; subtype?: string }): boolean {
@@ -100,8 +131,37 @@ export function createThreadTracker(opts: { negativeTtlMs?: number } = {}): Thre
   };
 }
 
+export type SlackConversationKind = "dm" | "channel" | "group";
+
 export function dmThreadRef(channel: string, threadTs?: string): string {
   return threadTs ? `dm:${channel}:${threadTs}` : `dm:${channel}`;
+}
+
+export function channelThreadRef(conversationKind: SlackConversationKind, channel: string, root: string): string {
+  return `${conversationKind === "group" ? "grp" : "ch"}:${channel}:${root}`;
+}
+
+export function slackThreadRefCandidates(channel: string, ts: string, threadTs?: string): string[] {
+  const root = threadTs || ts;
+  return [
+    ...new Set([
+      dmThreadRef(channel),
+      dmThreadRef(channel, root),
+      channelThreadRef("channel", channel, root),
+      channelThreadRef("group", channel, root),
+    ]),
+  ];
+}
+
+export interface SlackThreadRef {
+  container: string;
+  root?: string;
+}
+
+export function parseSlackThreadRef(threadRef: string): SlackThreadRef | null {
+  const m = /^(?:dm|ch|grp):([^:]+)(?::(.+))?$/.exec(threadRef);
+  if (!m) return null;
+  return { container: m[1]!, ...(m[2] ? { root: m[2] } : {}) };
 }
 
 export function dedupeKey(e: { event_id?: string; client_msg_id?: string; channel?: string; ts?: string }): string {
@@ -128,14 +188,15 @@ export async function dedupedRun(
   key: string,
   run: () => Promise<void>,
   onError: (err: unknown) => void,
-): Promise<void> {
-  if (deduper.seen(key)) return;
+): Promise<boolean> {
+  if (deduper.seen(key)) return false;
   try {
     await run();
   } catch (err) {
     deduper.forget(key);
     onError(err);
   }
+  return true;
 }
 
 export function isBareStop(text: string): boolean {
@@ -162,8 +223,10 @@ export async function maybeInterceptStop(opts: {
   threadRef: string;
   getInFlightRun: (threadRef: string) => string | undefined | Promise<string | undefined>;
   signalAbort: (runId: string) => Promise<void>;
+  stopConversation?: (threadRef: string) => Promise<boolean>;
 }): Promise<boolean> {
   if (!isBareStop(opts.text)) return false;
+  if (opts.stopConversation) return opts.stopConversation(opts.threadRef);
   const runId = await opts.getInFlightRun(opts.threadRef);
   if (!runId) return false;
   await opts.signalAbort(runId);

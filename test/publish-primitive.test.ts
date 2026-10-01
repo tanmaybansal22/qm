@@ -10,7 +10,7 @@ import { createAclStore, type AclStore } from "../src/acl/acl-store.ts";
 import { createMemoryConfigStore } from "../src/resolution/config-store.ts";
 import type { ToolLedger } from "../src/runs/tool-ledger.ts";
 import { CapabilityUnsupportedError } from "../src/sandbox/sandbox.ts";
-import type { AgentComputerBackupEntry, Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
+import type { AgentComputerExportEntry, Sandbox, SandboxHandle } from "../src/sandbox/sandbox.ts";
 import { scopeId } from "../src/types.ts";
 
 function svc() {
@@ -48,6 +48,7 @@ interface CtxOpts {
   ledger?: ToolLedger;
   runId?: string;
   rw?: boolean;
+  splitEnv?: Record<string, string>;
 }
 
 function fileSandbox(files: Array<{ path: string; data: Uint8Array }>): Sandbox {
@@ -58,7 +59,7 @@ function fileSandbox(files: Array<{ path: string; data: Uint8Array }>): Sandbox 
   return {
     listDir: async (_h: SandboxHandle, dir: string) => under(dir).map((f) => f.path),
     readFileBytes: async (_h: SandboxHandle, p: string) => files.find((f) => f.path === p)?.data ?? null,
-    backupComputer: async (_h: SandboxHandle, opts?: { includePaths?: readonly string[] }) => {
+    exportFiles: async (_h: SandboxHandle, opts?: { includePaths?: readonly string[] }) => {
       const dir = opts?.includePaths?.[0] ?? "";
       return under(dir).map((f) => ({ area: "workspace" as const, path: f.path, data: f.data }));
     },
@@ -81,6 +82,9 @@ function ctx(deploy: DeployService, opts: CtxOpts = {}) {
     createdBy: "U1",
     ...(opts.ledger ? { ledger: opts.ledger } : {}),
     ...(opts.runId ? { runId: opts.runId } : {}),
+    ...(opts.splitEnv
+      ? { actingSlackUserId: "U1", layerAuth: { credentialPaths: [], splitEnvTemplates: [opts.splitEnv] } }
+      : {}),
   });
 }
 
@@ -113,15 +117,15 @@ test("publish collects only the published dir (prefix-stripped) and returns a /d
   );
 });
 
-test("publish falls back to per-file reads when the routed backend refuses backupComputer", async () => {
+test("publish falls back to per-file reads when the routed backend refuses exportFiles", async () => {
   const s = svc();
   const files = [
     { path: "dist/server.js", data: bytes("listen") },
     { path: "dist/public/index.html", data: bytes("<h1>") },
   ];
   const sandbox = fileSandbox(files);
-  sandbox.backupComputer = async () => {
-    throw new CapabilityUnsupportedError("sprites", "backupComputer");
+  sandbox.exportFiles = async () => {
+    throw new CapabilityUnsupportedError("sprites", "exportFiles");
   };
   const warnings: unknown[][] = [];
   const warn = console.warn;
@@ -138,7 +142,7 @@ test("publish falls back to per-file reads when the routed backend refuses backu
   })();
   assert.equal(r.url, "/d/sprite-app/");
   assert.deepEqual(warnings, [
-    ["[publish] this computer's substrate (sprites) does not support backupComputer; falling back to per-file reads"],
+    ["[publish] this computer's substrate (sprites) does not support exportFiles; falling back to per-file reads"],
   ]);
   const d = (await s.deployStore.getByName("sprite-app"))!;
   assert.deepEqual(
@@ -148,11 +152,11 @@ test("publish falls back to per-file reads when the routed backend refuses backu
   );
 });
 
-test("publish still fails loudly when backupComputer breaks for any other reason", async () => {
+test("publish still fails loudly when exportFiles breaks for any other reason", async () => {
   const s = svc();
   const files = appFile("dist/server.js");
   const sandbox = fileSandbox(files);
-  sandbox.backupComputer = async () => {
+  sandbox.exportFiles = async () => {
     throw new Error("archive read failed");
   };
   const tc = ctx(s.deploy, { files, sandbox });
@@ -199,6 +203,42 @@ test("publish by name inherits the current entrypoint when redeploying without o
     (await s.deployStore.filesOf(d.id, 2))?.map((f) => ({ path: f.path, data: [...f.data] })),
     [{ path: "server.js", data: [...bytes("v2")] }],
   );
+});
+
+test("publish by name keeps the previous version's env unless the call replaces it", async () => {
+  const s = svc();
+  const files = [{ path: "app/server.js", data: bytes("v1") }];
+  await ctx(s.deploy, { files }).publish({
+    dir: "app",
+    entrypoint: "node server.js",
+    name: "dash",
+    env: { DB: "one" },
+  });
+  await ctx(s.deploy, { files }).publish({ dir: "app", name: "dash" });
+  await ctx(s.deploy, { files }).publish({ dir: "app", name: "dash", env: { OTHER: "x" } });
+  await ctx(s.deploy, { files }).publish({ dir: "app", name: "dash", env: {} });
+  const envs = (await s.deployStore.getByName("dash"))!.versions.map((v) => v.env);
+  assert.deepEqual(envs, [{ DB: "one" }, { DB: "one" }, { OTHER: "x" }, {}]);
+});
+
+test("publish from a layer with split env stamps it on top of the previous version's env when env is omitted", async () => {
+  const s = svc();
+  const files = [{ path: "app/server.js", data: bytes("v1") }];
+  const splitEnv = { ACTING: "{actingSlackUserId}" };
+  await ctx(s.deploy, { files, splitEnv }).publish({
+    dir: "app",
+    entrypoint: "node server.js",
+    name: "dash",
+    env: { DB: "one" },
+  });
+  await ctx(s.deploy, { files, splitEnv }).publish({ dir: "app", name: "dash", env: { DB: "two" } });
+  await ctx(s.deploy, { files, splitEnv }).publish({ dir: "app", name: "dash" });
+  const envs = (await s.deployStore.getByName("dash"))!.versions.map((v) => v.env);
+  assert.deepEqual(envs, [
+    { DB: "one", ACTING: "U1" },
+    { DB: "two", ACTING: "U1" },
+    { DB: "two", ACTING: "U1" },
+  ]);
 });
 
 test("publish without an entrypoint and without a prior version fails before provisioning", async () => {
@@ -248,6 +288,7 @@ test("publish: renameFrom moves the link but keeps the id (and shares ride the i
 
   assert.equal(renamed.id, created.id);
   assert.equal(renamed.url, "/d/new-name/");
+  assert.equal((await s.deployStore.getByName("new-name"))!.versions.length, 1, "a pure rename ships no version");
   assert.equal(await s.deployStore.getByName("old-name"), null);
   assert.equal((await s.deployStore.getByName("new-name"))!.id, created.id);
   assert.equal((await s.acl.grantsFor(scopeId("personal", "U1"), `deployment:${created.id}`)).length, 1);
@@ -284,7 +325,7 @@ test("publish collects the app tree as ONE archive (not file-by-file)", async ()
       perFileReads++;
       return null;
     },
-    backupComputer: async (
+    exportFiles: async (
       _h: SandboxHandle,
       opts?: { include?: Array<"workspace" | "home">; includePaths?: readonly string[] },
     ) => {
@@ -324,9 +365,9 @@ test("publish FAILS LOUDLY on a flaky archive read — it never silently drops f
   const sandbox = {
     listDir: async () => [],
     readFileBytes: async () => null,
-    backupComputer: async (_h: SandboxHandle, opts?: { include?: Array<"workspace" | "home"> }) => {
+    exportFiles: async (_h: SandboxHandle, opts?: { include?: Array<"workspace" | "home"> }) => {
       if (opts?.include?.includes("home")) return [];
-      throw new Error("fly backup workspace read-back failed");
+      throw new Error("fly export workspace read-back failed");
     },
   } as unknown as Sandbox;
   const tc = createToolContext({
@@ -349,7 +390,7 @@ test("publish FAILS LOUDLY on a flaky archive read — it never silently drops f
   assert.equal((await s.deployStore.list()).length, 0, "nothing half-shipped");
 });
 
-test("publish on a sandbox WITHOUT backupComputer (AWS) still collects the tree, and a null read FAILS LOUDLY", async () => {
+test("publish on a sandbox WITHOUT exportFiles (AWS) still collects the tree, and a null read FAILS LOUDLY", async () => {
   const files = [
     { path: "app/server.js", data: bytes("listen") },
     { path: "app/ok.txt", data: bytes("ok") },
@@ -475,7 +516,7 @@ test("publish is ledgered (G6): a crash-replay returns the cached result, not a 
 });
 
 test("publish never copies resident credentials into the deployment", async () => {
-  const home: AgentComputerBackupEntry[] = [
+  const home: AgentComputerExportEntry[] = [
     { area: "home", path: ".aws/credentials", data: bytes("[default]") },
     { area: "home", path: ".config/gh/hosts.yml", data: bytes("gh") },
     { area: "home", path: ".config/gcloud/access_tokens.db", data: bytes("gcloud") },
@@ -486,7 +527,7 @@ test("publish never copies resident credentials into the deployment", async () =
     { area: "home", path: "secret-notes.txt", data: bytes("private") },
     { area: "home", path: ".config/fish/config.fish", data: bytes("shell") },
   ];
-  const sandbox = backupSandbox(home);
+  const sandbox = exportSandbox(home);
 
   let captured: DeployOrUpdateInput | undefined;
   const deploy = {
@@ -523,15 +564,15 @@ test("publish never copies resident credentials into the deployment", async () =
   assert.equal(captured!.homeFiles, undefined);
 });
 
-function backupSandbox(entries: AgentComputerBackupEntry[], workspace = appFile("s.js")): Sandbox {
-  const all: AgentComputerBackupEntry[] = [
+function exportSandbox(entries: AgentComputerExportEntry[], workspace = appFile("s.js")): Sandbox {
+  const all: AgentComputerExportEntry[] = [
     ...workspace.map((f) => ({ area: "workspace" as const, path: f.path, data: f.data })),
     ...entries,
   ];
   return {
     listDir: async () => workspace.map((f) => f.path),
     readFileBytes: async (_h: SandboxHandle, p: string) => workspace.find((f) => f.path === p)?.data ?? null,
-    backupComputer: async (
+    exportFiles: async (
       _h: SandboxHandle,
       opts?: {
         include?: Array<"workspace" | "home">;
@@ -570,18 +611,18 @@ function spyDeploy(): { deploy: DeployService; captured: () => DeployOrUpdateInp
   return { deploy, captured: () => captured };
 }
 
-const RESIDENT_HOME: AgentComputerBackupEntry[] = [
+const RESIDENT_HOME: AgentComputerExportEntry[] = [
   { area: "home", path: ".aws/credentials", data: bytes("[default]") },
   { area: "home", path: ".acmecli/config.json", data: bytes("{}") },
   { area: "home", path: ".config/gh/hosts.yml", data: bytes("gh") },
   { area: "home", path: ".netrc", data: bytes("machine") },
 ];
 
-test("publish always splits: bakes NO resident creds, injects the layer's acting-as env", async () => {
+test("publish always splits: bakes NO resident creds and injects no acting-as env", async () => {
   const config = createMemoryConfigStore("default-org");
   const { deploy, captured } = spyDeploy();
   const tc = createToolContext({
-    sandbox: backupSandbox(RESIDENT_HOME),
+    sandbox: exportSandbox(RESIDENT_HOME),
     provision: async () => ({}) as SandboxHandle,
     layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
     commandPolicy: () => ({}) as never,
@@ -592,41 +633,12 @@ test("publish always splits: bakes NO resident creds, injects the layer's acting
     acl: {} as never,
     createdBy: "U1",
     config,
-    actingSlackUserId: "U1",
-    layerAuth: {
-      credentialPaths: [{ path: ".acmecli", kind: "directory" }],
-      splitEnvTemplates: [{ ACMECLI_ACTING_SLACK_USER_ID: "{actingSlackUserId}", ACMECLI_PLATFORM: "slack" }],
-    },
   });
   await tc.publish({ entrypoint: "node s.js", name: "split-app" });
 
   const c = captured()!;
   assert.equal((c.homeFiles ?? []).length, 0, "split bakes no third-party creds and no raw .acmecli");
-  assert.equal(c.env?.ACMECLI_ACTING_SLACK_USER_ID, "U1", "the layer CLI acts AS the originator via env");
-  assert.equal(c.env?.ACMECLI_PLATFORM, "slack");
-});
-
-test("publish off-Slack: injects nothing (no acting-as id, no baked creds)", async () => {
-  const config = createMemoryConfigStore("default-org");
-  const { deploy, captured } = spyDeploy();
-  const tc = createToolContext({
-    sandbox: backupSandbox(RESIDENT_HOME),
-    provision: async () => ({}) as SandboxHandle,
-    layers: [{ scopeId: scopeId("personal", "U1"), mountPath: "", mode: "rw" }],
-    commandPolicy: () => ({}) as never,
-    authorizeCommand: () => false,
-    grantedHandles: [],
-    workspace: {} as never,
-    deploy,
-    acl: {} as never,
-    createdBy: "U1",
-    config,
-  });
-  await tc.publish({ entrypoint: "node s.js", name: "split-web" });
-
-  const c = captured()!;
-  assert.equal((c.homeFiles ?? []).length, 0, "no creds baked under split");
-  assert.equal(c.env, undefined, "no acting-as env without a Slack id");
+  assert.equal(c.env, undefined, "the layer never injects an acting-as env; identity rides the broker token");
 });
 
 test("publish rejects an invalid or id-shaped name, and a turn with no writable scope", async () => {
@@ -674,8 +686,8 @@ test("publish drops git metadata on the per-file fallback path too", async () =>
     { path: ".git/config", data: bytes("[core]\n") },
   ];
   const sandbox = fileSandbox(files);
-  sandbox.backupComputer = async () => {
-    throw new CapabilityUnsupportedError("sprites", "backupComputer");
+  sandbox.exportFiles = async () => {
+    throw new CapabilityUnsupportedError("sprites", "exportFiles");
   };
   const tc = ctx(s.deploy, { files, sandbox });
   await tc.publish({ entrypoint: "node server.js", name: "gitty-fallback" });

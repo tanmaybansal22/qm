@@ -1,4 +1,15 @@
-import type { AttachmentMeta, ConversationTurn, ScopeId, Session, SessionEntry } from "../types.ts";
+import type { DocumentInput } from "../core/document-inputs.ts";
+import type { RuntimeControl, HarnessHandoff } from "./runtime-types.ts";
+import type {
+  AttachmentMeta,
+  ClientToolDeclaration,
+  ConversationTurn,
+  ScopeId,
+  Session,
+  SessionEntry,
+  TurnRequest,
+} from "../types.ts";
+import type { HarnessId } from "../model/pi-models.ts";
 import type {
   GapPhases,
   GapWork,
@@ -10,9 +21,17 @@ import type {
 } from "../sessions/session-store.ts";
 export type { GapWork } from "../sessions/session-store.ts";
 import type { OverheardEntryPayload } from "./replay.ts";
+import type { GoalRecord } from "./goal.ts";
 import type { ProviderKeys } from "./pi-harness.ts";
 import type { ToolContext } from "../tools/primitives.ts";
-import type { SecurityScreenVerdict } from "../security/security-posture.ts";
+import type { SecurityScreenVerdict, ToolResultScreen, ToolResultScreenInput } from "../security/security-posture.ts";
+
+export interface RuntimeChoice {
+  harnessId: HarnessId;
+  modelId: string;
+  effortLevel?: string;
+  fastMode?: boolean;
+}
 
 interface HarnessImage {
   mimeType: string;
@@ -20,9 +39,27 @@ interface HarnessImage {
   artifactId?: string;
 }
 
-export function envelopeWithoutMessages(payload: unknown): unknown {
+export function promptEnvelopeWithoutHistory(payload: unknown): unknown {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return payload;
-  return Object.fromEntries(Object.entries(payload as Record<string, unknown>).filter(([k]) => k !== "messages"));
+  const envelope: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "contents") continue;
+    if (key === "messages" || key === "input") {
+      if (Array.isArray(value)) {
+        const instructions = value.filter(
+          (item: unknown) =>
+            item !== null &&
+            typeof item === "object" &&
+            "role" in item &&
+            (item.role === "system" || item.role === "developer"),
+        );
+        if (instructions.length) envelope[key] = instructions;
+      }
+    } else {
+      envelope[key] = key === "context" ? promptEnvelopeWithoutHistory(value) : value;
+    }
+  }
+  return envelope;
 }
 
 export interface HarnessLlmRequestRecord {
@@ -40,8 +77,11 @@ export interface HarnessLlmRequestRecord {
   usage?: LlmCallUsage | null;
 }
 
-interface HarnessSecurityScreenInput {
+export interface HarnessSecurityScreenInput {
   payload: string;
+  harnessId?: string;
+  modelId?: string;
+  systemPrompt?: string;
   signal: AbortSignal;
   recordModelCall(rec: { model: string; inputTokens: number; entryCount: number }): void;
   recordLlmRequest?(rec: HarnessLlmRequestRecord, signal?: AbortSignal): void | Promise<void>;
@@ -70,25 +110,27 @@ export interface HarnessTurnInput {
   overheard?: OverheardEntryPayload[];
   attachments?: AttachmentMeta[];
   images?: HarnessImage[];
-  model?: string;
-  harness?: string;
-  thinkingLevel?: string;
-  fastMode?: boolean;
+  prepareSteer?(
+    text: string,
+    request?: TurnRequest,
+  ): Promise<{ text: string; attachments?: AttachmentMeta[]; images?: HarnessImage[]; documents?: DocumentInput[] }>;
+  documents?: DocumentInput[];
+  runtime?: Partial<RuntimeChoice>;
+  runtimePurpose?: import("../resolution/config-store.ts").RuntimePurpose;
+  runtimeControl?: RuntimeControl;
+  runtimeActorId?: string;
   readOnly?: boolean;
   surfaceTools?: boolean;
+  delegateWork?: boolean;
   surfaceName?: string;
+  clientTools?: readonly ClientToolDeclaration[];
   pollFire?: boolean;
   turnWallClockMs?: number;
   systemPrompt: string;
-  systemCacheBoundary?: number;
   history: SessionEntry[];
+  goal?: GoalRecord | null;
   tools: ToolContext;
-  credentialExecServices?: readonly { service: string; binary: string }[];
-  screenExternalContent?(input: {
-    content: string;
-    tool: string;
-    source: string;
-  }): Promise<SecurityScreenVerdict | undefined>;
+  commandCredentialHandles?: readonly string[];
   toolApprovalGate?(tool: string): boolean;
   emit(entry: NewEntry): Promise<SessionEntry>;
   tape?(rec: NewTapeRecord): Promise<unknown>;
@@ -106,14 +148,19 @@ export interface HarnessTurnInput {
   onProgress?(p: { toolCalls: number; tokens?: number }): void;
   onGapWork?(sink: (work: GapWork) => void): void;
   onDelta?(chunk: string): void;
-  onTextBlockStart?(): void;
-  screenToolResult?(tool: string, result: string, unscreenable: boolean): Promise<boolean | "unscreened">;
+  onTextBlockStart?(phase?: "commentary" | "final_answer"): void | Promise<void>;
+  onToolCallStart?(name: string): void;
+  screenToolResult?(input: ToolResultScreenInput): Promise<ToolResultScreen>;
+  verifyGoal?: import("./goal.ts").GoalVerifier;
 }
 
 export interface HarnessTurnResult {
+  runtimeHandoff?: HarnessHandoff;
   reply: string;
   silent?: boolean;
   stopped?: true;
+  stoppedByUser?: true;
+  stoppedTapeComplete?: true;
   pendingApprovals?: Array<{
     command: string;
     reason: string;
@@ -121,12 +168,12 @@ export interface HarnessTurnResult {
     matched?: string;
     purpose?: string;
     approvalKey?: string;
+    grantModes?: { session: boolean; always: boolean };
   }>;
   pausedOnApproval?: boolean;
   modelCalls?: number;
   cacheUsage?: { cacheRead: number; cacheWrite: number; uncachedInput: number };
   compileMs?: number;
-  tapeWriteFailed?: boolean;
 }
 
 export interface HarnessDetectInput {
@@ -163,7 +210,7 @@ export interface HarnessModelUtilities {
   compactHistory?(input: HarnessCompactInput): Promise<string>;
   contextTokenBudget?(scopeLabel?: string, model?: string): number | undefined;
   oneShot?(systemPrompt: string, prompt: string): Promise<string | undefined>;
-  judge?(systemPrompt: string, prompt: string): Promise<string | undefined>;
+  judge?(systemPrompt: string, prompt: string, signal?: AbortSignal): Promise<string | undefined>;
   screenSecurity?(input: HarnessSecurityScreenInput): Promise<SecurityScreenVerdict | undefined>;
   pickAckEmoji?(text: string, candidates: readonly string[]): Promise<string | undefined>;
   generateTitle?(transcript: string): Promise<string | undefined>;
@@ -172,7 +219,15 @@ export interface HarnessModelUtilities {
 
 type HarnessControlTransport = "mock" | "in-process" | "sdk" | "http" | "json-rpc" | "api";
 type HarnessToolTransport = "mock" | "in-process" | "plugin" | "dynamic" | "in-process-mcp" | "mcp";
-type HarnessCapability = "abort" | "steer" | "images" | "thinking-level" | "fast-mode" | "provider-sessions";
+type HarnessCapability =
+  | "abort"
+  | "steer"
+  | "images"
+  | "thinking-level"
+  | "fast-mode"
+  | "provider-sessions"
+  | "native-tape"
+  | "goal-enforcement";
 
 export interface HarnessAdapterProfile {
   id: string;

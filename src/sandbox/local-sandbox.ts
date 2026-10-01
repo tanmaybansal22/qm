@@ -1,3 +1,4 @@
+import { cleanupFailedProvision } from "./sandbox.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { orgId as configOrgId } from "../config.ts";
 import { arch } from "node:os";
@@ -11,12 +12,13 @@ import { shq } from "../util/shell.ts";
 import { nonInteractiveShellPrefix } from "./sandbox-env.ts";
 import { createExecProcessSessions, type ExecProcessIo } from "./exec-process-session.ts";
 import { materializeRoLayers } from "./ro-layers.ts";
-import { createExecBackup, createExecFileOps, posixJoin } from "./exec-file-ops.ts";
+import { createExecExport, createExecFileOps, posixJoin } from "./exec-file-ops.ts";
 import { spawnDockerExec, type DockerExec } from "./docker-exec.ts";
 import { ephemeralCredLinkScript } from "../credentials/resident-paths.ts";
 import { ephemeralCredLinkPaths } from "../credentials/resident-paths.ts";
 import { shortHash } from "../util/crypto.ts";
 import { killableScript, killScript } from "./exec-kill.ts";
+import { execFailureDetail } from "./sandbox.ts";
 import type {
   AgentComputerProfile,
   ExecOptions,
@@ -35,6 +37,7 @@ const RO_LAYERS_TAR = ".ro-layers.tar";
 const RO_LAYERS_MANIFEST = ".ro-layers.manifest";
 const FINGERPRINT_LABEL = "qm.sandbox-fingerprint";
 const BUILD_HINT = "run `npm run sandbox:local:build`";
+const PREP_TIMEOUT_SEC = 30;
 
 export type { DockerExec };
 
@@ -342,6 +345,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     backend: "local-docker",
     writablePersistence: "resident_disk",
     processSessions: true,
+    parksOnTeardown: true,
     egressEnforcement: "none",
     spec: {
       os: `Debian 12 (bookworm), glibc — local Docker container on a ${arch()} host`,
@@ -370,7 +374,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
     writeInline: (id, abs, data) => writeAbsBytes(id, abs, data),
   });
 
-  const execBackup = createExecBackup({
+  const execExport = createExecExport({
     label: "local",
     exec: (id, script, t) => execRaw(id, script, t),
     readAbsBytes,
@@ -405,8 +409,15 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       };
 
       try {
-        const prep = await execRaw(name, `mkdir -p ${shq(workspaceDir)} && ${ephemeralCredLinkScript(homeDir)}`, 30);
-        if (prep.code !== 0) throw new Error(`local sandbox provision prep failed: ${prep.stderr.slice(0, 200)}`);
+        const prep = await execRaw(
+          name,
+          `mkdir -p ${shq(workspaceDir)} && ${ephemeralCredLinkScript(homeDir)}`,
+          PREP_TIMEOUT_SEC,
+        );
+        if (prep.code !== 0)
+          throw new Error(
+            `local sandbox provision prep failed: ${execFailureDetail(prep, PREP_TIMEOUT_SEC).slice(0, 200)}`,
+          );
 
         await materializeRoLayers(
           workspace,
@@ -422,7 +433,7 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
 
         return handle;
       } catch (err) {
-        await sandbox.teardown(handle).catch(swallowAs("local-sandbox: teardown after failed provision", undefined));
+        await cleanupFailedProvision(sandbox, handle);
         throw err;
       }
     },
@@ -440,10 +451,10 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       const fireKill = () => {
         execRaw(handle.id, killScript(killUid), 15).catch(swallowAs("local-sandbox: kill in-flight exec", undefined));
       };
-      if (signal.aborted) fireKill();
       const onAbort = () => fireKill();
       signal.addEventListener("abort", onAbort, { once: true });
       try {
+        signal.throwIfAborted();
         return await execRaw(handle.id, killableScript(script, killUid), timeoutSec, signal);
       } finally {
         signal.removeEventListener("abort", onAbort);
@@ -464,7 +475,36 @@ export function createLocalSandbox(workspace: WorkspaceStore, opts: LocalSandbox
       return bytes === null ? null : Buffer.from(bytes).toString("utf8");
     },
 
-    backupComputer: execBackup.backupComputer,
+    exportFiles: execExport.exportFiles,
+
+    async destroyScope(scopeId: string): Promise<void> {
+      return provisionQueue(scopeId, async () => {
+        const name = localContainerName(scopeId);
+        const network = localNetworkName(name);
+        const remove = async (args: string[]) => {
+          const result = await dexec(args);
+          if (
+            result.code !== 0 &&
+            !/no such (container|object|network|volume)|network .* not found/i.test(result.stderr)
+          )
+            throw new Error(`docker ${args.join(" ")}: ${result.stderr.trim()}`);
+        };
+        await remove(["rm", "-f", name]);
+        if (opts.coreContainer) {
+          const result = await dexec(["network", "disconnect", "-f", network, opts.coreContainer]);
+          if (
+            result.code !== 0 &&
+            !/no such (network|container|object)|is not connected|network .* not found/i.test(result.stderr)
+          )
+            throw new Error(`docker network disconnect ${network}: ${result.stderr.trim()}`);
+        }
+        await remove(["network", "rm", network]);
+        await remove(["volume", "rm", localVolumeName(scopeId)]);
+        activeByContainer.delete(name);
+        scopeByContainer.delete(name);
+        portByName.delete(name);
+      });
+    },
 
     async teardown(handle, tdOpts?: TeardownOptions): Promise<void> {
       return provisionQueue(teardownQueueKey(handle), async () => {

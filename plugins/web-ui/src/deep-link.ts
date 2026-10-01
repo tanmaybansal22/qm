@@ -1,3 +1,5 @@
+import { messageLinkSeq } from "./message-link.ts";
+
 export const UI_BASE = ((import.meta as unknown as { env?: { BASE_URL?: string } }).env?.BASE_URL ?? "/").replace(
   /\/$/,
   "",
@@ -15,7 +17,10 @@ export function deepLinkPath(
     if (itemId) throw new Error("the contexts view is addressed by scope, not by item id");
     return `${b}/contexts?scope=${encodeURIComponent(contextScope)}`;
   }
-  if (view !== "chats") return `${b}/${encodeURIComponent(view)}${itemId ? `/${encodeURIComponent(itemId)}` : ""}`;
+  if (view !== "chats") {
+    const pathView = view === "deploys" ? "apps" : view;
+    return `${b}/${encodeURIComponent(pathView)}${itemId ? `/${encodeURIComponent(itemId)}` : ""}`;
+  }
   if (itemId) throw new Error("the chats view is addressed by session, not by item id");
   return sessionId ? `${b}/s/${encodeURIComponent(sessionId)}` : `${b}/`;
 }
@@ -44,32 +49,51 @@ export function parseDeepLink(
   if (pathView === "projects") {
     projectItem = projectKind ? decodeSegment(segments[2] ?? "") : decodeSegment(segments[1] ?? "");
   }
-  const sessionSeg = pathView === "s" ? decodeSegment(segments[1] ?? "") : null;
-  let fallbackView = pathView;
-  if (pathView === "projects") fallbackView = "contexts";
-  else if (pathView === "s") fallbackView = "chats";
-  const requestedView = params.get("view") ?? fallbackView;
-  const view = requestedView === "connectors" ? "keychain" : requestedView;
+  const sessionRoute = pathView === "s" || pathView === "c";
+  const sessionSeg = sessionRoute ? decodeSegment(segments[1] ?? "") : null;
+  const viewFor = (): string | null => {
+    if (pathView === "projects") return "contexts";
+    if (sessionRoute) return "chats";
+    return pathView;
+  };
+  const requestedView = params.get("view") ?? viewFor();
+  let view = requestedView;
+  if (view === "connectors") view = "keychain";
+  else if (view === "apps") view = "deploys";
+  const itemFor = (): string | null => {
+    if (sessionRoute) return null;
+    if (pathView === "projects" && projectKind && projectItem) return `${projectKind}:${projectItem}`;
+    return projectItem ?? decodeSegment(segments[1] ?? "");
+  };
   return {
     view,
     session: sessionSeg ?? params.get("session"),
-    item: itemFor(pathView, projectKind, projectItem, segments),
+    item: itemFor(),
   };
 }
 
-function itemFor(
-  pathView: string | null,
-  projectKind: string | null,
-  projectItem: string | null,
-  segments: string[],
-): string | null {
-  if (pathView === "s") return null;
-  if (pathView === "projects" && projectKind && projectItem) return `${projectKind}:${projectItem}`;
-  return projectItem ?? decodeSegment(segments[1] ?? "");
+export function sessionLink(origin: string, base: string, sessionId: string, seq?: number): string {
+  const suffix = seq !== undefined && Number.isSafeInteger(seq) && seq >= 0 ? `?seq=${seq}` : "";
+  return `${origin}${deepLinkPath(base, "chats", sessionId)}${suffix}`;
 }
 
-export function sessionLink(origin: string, base: string, sessionId: string): string {
-  return `${origin}${deepLinkPath(base, "chats", sessionId)}`;
+/** The session a same-app link points at (`/s/<id>`, optionally `?seq=N`), or null for anything else. */
+export function sessionLinkTarget(
+  href: string,
+  origin: string,
+  base: string,
+): { session: string; seq: number | null } | null {
+  let url: URL;
+  try {
+    url = new URL(href, origin);
+  } catch {
+    return null;
+  }
+  const b = base.replace(/\/$/, "");
+  if (url.origin !== origin || (b && url.pathname !== b && !url.pathname.startsWith(`${b}/`))) return null;
+  const linked = parseDeepLink(b, url.pathname, url.search);
+  if (linked.view !== "chats" || !linked.session) return null;
+  return { session: linked.session, seq: messageLinkSeq(url.search) };
 }
 
 /** True for an unmodified left click — the case an in-app link should handle itself (SPA nav). Modified clicks (cmd/ctrl/shift/alt, middle-click) fall through to the browser so "open in new tab" works. */

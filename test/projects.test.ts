@@ -22,6 +22,7 @@ import {
 } from "../src/resolution/scope-membership.ts";
 import { buildApp } from "../src/wiring.ts";
 import { testConfig } from "./support/test-config.ts";
+import { runNowSettled } from "./support/settle.ts";
 
 test("ProjectStore atomically maintains a managed-group roster", async () => {
   let at = 10;
@@ -41,6 +42,44 @@ test("ProjectStore atomically maintains a managed-group roster", async () => {
   assert.equal(await projects.membership(projectGroupRef(project.id), "alice"), true);
   assert.deepEqual(await projects.members(projectGroupRef(project.id)), ["owner", "alice", "bob", "mallory"]);
   assert.equal(await projects.name(projectGroupRef(project.id)), "Launch Cohort");
+});
+
+test("session lists check each project once per request and observe membership changes", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "project-list-membership-")) }));
+  try {
+    const project = await built.projects.create({ name: "Shared history", ownerId: "owner" });
+    await built.projects.addMember(project.id, "owner", "member");
+    for (let i = 0; i < 50; i++) {
+      const session = await built.sessions.getOrCreateByThread(
+        `web:member:history-${i}`,
+        "group",
+        projectScopeId(project.id),
+      );
+      await built.sessions.addParticipant(session.id, "member", undefined, { includeHistory: true });
+      await built.sessions.updateTitle(session.id, `History ${i}`);
+    }
+    const get = built.projects.get.bind(built.projects);
+    const membership = built.projects.membership.bind(built.projects);
+    let gets = 0;
+    let memberships = 0;
+    built.projects.get = async (id) => {
+      gets++;
+      return get(id);
+    };
+    built.projects.membership = async (ref, principal) => {
+      memberships++;
+      return membership(ref, principal);
+    };
+    assert.equal((await built.app.listSessions("member")).length, 50);
+    assert.equal(gets, 1);
+    assert.equal(memberships, 1);
+    await built.projects.removeMember(project.id, "owner", "member");
+    assert.deepEqual(await built.app.listSessions("member"), []);
+    assert.equal(gets, 2);
+    assert.equal(memberships, 2);
+  } finally {
+    await built.runtime.stop();
+  }
 });
 
 test("ProjectStore rename is owner-only and cleans the name", async () => {
@@ -296,7 +335,7 @@ test("Project routes use ordinary group sessions with the durable roster as auth
 
   assert.equal((await turn("owner", "web:owner:first", "secret-before-join")).status, "ok");
   assert.equal((await built.runs.list())[0]?.request.scopeVersion, await built.projects.version(groupRef));
-  const [first] = (await built.sessions.listAll()).filter((session) => session.scopeId === scope);
+  const [first] = (await built.sessions.scanAll()).filter((session) => session.scopeId === scope);
   assert.ok(first);
   assert.equal(first.channelName, "Launch Cohort");
   assert.ok(!(await built.sessions.listByParticipant("outsider")).some((session) => session.id === first.id));
@@ -405,7 +444,7 @@ test("Project routes use ordinary group sessions with the durable roster as auth
     grantedBy: "owner",
   });
   assert.equal((await deploy.reachDeployment(deployment.id, "member")).status, "ok");
-  assert.equal((await turn("owner", "web:owner:first", "after joining")).status, "ok");
+  assert.equal((await turn("owner", "web:owner:first", "Simulate four-way title outage after joining")).status, "ok");
   assert.ok((await built.app.listSessions("member")).some((session) => session.id === first.id));
   const latestRequest = (await built.sessions.listLlmRequests(first.id)).at(-1)!;
   assert.match(JSON.stringify(latestRequest.promptEnvelope), /secret-before-join/);
@@ -428,11 +467,23 @@ test("Project routes use ordinary group sessions with the durable roster as auth
 
   const globalTitle = (await built.sessions.get(first.id))?.title ?? null;
   const regenerated = await built.app.regenerateTitle(first.id, "member");
-  assert.ok(regenerated?.title);
+  assert.equal(regenerated?.title, "secret-before-join");
   assert.equal((await built.sessions.get(first.id))?.title ?? null, globalTitle);
   assert.equal(
-    (await built.sessions.listByParticipant("member")).find((session) => session.id === first.id)?.title,
+    (await built.app.listSessions("member")).find((session) => session.id === first.id)?.title,
     regenerated.title,
+  );
+  assert.equal((await built.app.listSessions("owner")).find((session) => session.id === first.id)?.title, globalTitle);
+  assert.equal(await built.app.regenerateTitle(first.id, "outsider"), null);
+  assert.ok(await built.app.updateSession(first.id, "owner", { title: "Owner-only project title" }));
+  assert.equal((await built.sessions.get(first.id))?.title ?? null, globalTitle);
+  assert.equal(
+    (await built.app.listSessions("member")).find((session) => session.id === first.id)?.title,
+    regenerated.title,
+  );
+  assert.equal(
+    (await built.app.listSessions("owner")).find((session) => session.id === first.id)?.title,
+    "Owner-only project title",
   );
   const unchangedAdd = await built.app.addProjectMember(project.id, "owner", "member");
   assert.equal(unchangedAdd.status, "ok");
@@ -517,7 +568,7 @@ test("Project routes use ordinary group sessions with the durable roster as auth
     leaseIndex >= 0 && participantIndex > leaseIndex,
     "Project participant reconciliation happens only after the lease",
   );
-  const projectSessions = (await built.sessions.listAll()).filter((session) => session.scopeId === scope);
+  const projectSessions = (await built.sessions.scanAll()).filter((session) => session.scopeId === scope);
   assert.equal(projectSessions.length, 6);
   for (const session of projectSessions) {
     assert.ok((await built.sessions.listByParticipant("member")).some((candidate) => candidate.id === session.id));
@@ -577,7 +628,7 @@ test("Project routes use ordinary group sessions with the durable roster as auth
   assert.equal(healed.status === "ok" && healed.changed, false);
   const outsiderSessions = await built.sessions.listByParticipant("outsider");
   assert.ok(projectSessions.every((session) => outsiderSessions.some((candidate) => candidate.id === session.id)));
-  const globalTitles = new Map((await built.sessions.listAll()).map((session) => [session.id, session.title ?? null]));
+  const globalTitles = new Map((await built.sessions.scanAll()).map((session) => [session.id, session.title ?? null]));
   assert.ok(outsiderSessions.every((session) => (session.title ?? null) === globalTitles.get(session.id)));
   assert.equal((await built.app.removeProjectMember(project.id, "owner", "outsider")).status, "ok");
 
@@ -1055,4 +1106,158 @@ test("Project slack-channel routes gate on visibility and workspace use, and syn
   assert.equal(await built.projects.membership(groupRef, "chan-pal"), false);
   assert.equal(await built.projects.membership(groupRef, "member"), true);
   assert.ok(!(await built.app.listSessions("chan-pal")).some((s) => s.scopeId === scope));
+});
+
+test("a project can add a signed-in principal on a deployment whose directory is never populated", async () => {
+  const built = buildApp(
+    testConfig({
+      dataDir: mkdtempSync(join(tmpdir(), "projects-web-only-")),
+      emailAuthPrincipals: ["dana@acme.com"],
+    }),
+  );
+  const session = await built.sessions.getOrCreateByThread("web:rex", "dm", "personal:rex@acme.com");
+  await built.sessions.addParticipant(session.id, "rex@acme.com");
+
+  const project = (await built.app.createProject("dana@acme.com", "demo"))!;
+  const added = await built.app.addProjectMember(project.id, "dana@acme.com", "rex@acme.com");
+
+  assert.equal(added.status, "ok");
+  assert.ok(added.project!.memberIds.includes("rex@acme.com"));
+});
+
+test("Slack-linked project turns use the inherited channel roster", async () => {
+  const built = buildApp(testConfig({ dataDir: mkdtempSync(join(tmpdir(), "projects-linked-roster-")) }));
+  await built.app.upsertDirectory([
+    { principalId: "owner", displayName: "Owner", type: "internal" },
+    { principalId: "chan-pal", displayName: "Channel Pal", type: "internal" },
+    { principalId: "chan-gone", displayName: "Channel Gone", type: "internal" },
+  ]);
+  const channels = [{ channelId: "C-ENG", name: "eng", isPrivate: false }];
+  await built.app.upsertChannels(channels, [
+    { channelId: "C-ENG", principalId: "owner" },
+    { channelId: "C-ENG", principalId: "chan-pal" },
+  ]);
+  const project = await built.app.createProject("owner", "Linked Roster");
+  assert.ok(project);
+  const groupRef = projectGroupRef(project.id);
+  const linked = await built.app.setProjectSlackChannel(project.id, "owner", "#eng");
+  assert.equal(linked.status, "ok");
+  assert.equal(await built.projects.membership(groupRef, "chan-pal"), true);
+
+  const turn = (actor: string, threadRef: string, text = "hello linked project") =>
+    built.app.turn({
+      surface: "web",
+      actor: { externalId: actor },
+      conversation: {
+        kind: "group",
+        channelRef: groupRef,
+        threadRef,
+        audience: [{ externalId: "outsider" }],
+      },
+      text,
+    });
+  const rosterOf = async (threadRef: string) => {
+    const run = (await built.runs.list()).findLast(
+      (candidate) => candidate.request.conversation.threadRef === threadRef,
+    );
+    assert.ok(run);
+    const session = await built.sessions.getByThread(threadRef);
+    assert.ok(session);
+    return {
+      participants: new Set(run.request.sessionParticipantIds),
+      audience: new Set(run.request.conversation.audience.map((member) => member.id)),
+      session: new Set(await built.sessions.participantsOf(session.id)),
+    };
+  };
+  const assertRoster = async (threadRef: string, expected: string[]) => {
+    const roster = await rosterOf(threadRef);
+    const wanted = new Set(expected);
+    assert.deepEqual(roster.participants, wanted);
+    assert.deepEqual(roster.audience, wanted);
+    assert.deepEqual(roster.session, wanted);
+  };
+
+  assert.equal((await turn("owner", "web:owner:linked")).status, "ok");
+  await assertRoster("web:owner:linked", ["owner", "chan-pal"]);
+  assert.equal((await turn("chan-pal", "web:chan-pal:linked")).status, "ok");
+  await assertRoster("web:chan-pal:linked", ["owner", "chan-pal"]);
+
+  const linkedMembers = [
+    { id: "owner", type: "internal" as const },
+    { id: "chan-pal", type: "internal" as const },
+  ];
+  const ownerCron = await built.app.createCron({
+    ownerScopeId: project.scopeId,
+    owner: "owner",
+    createdBy: "owner",
+    action: "linked roster work",
+    schedule: { everyMs: 60_000 },
+    runAs: "scopeShared",
+    members: linkedMembers,
+  });
+  const inheritedCron = await built.app.createCron({
+    ownerScopeId: project.scopeId,
+    owner: "chan-pal",
+    createdBy: "chan-pal",
+    action: "inherited member work",
+    schedule: { everyMs: 60_000 },
+    runAs: "scopeShared",
+    members: linkedMembers,
+  });
+  const cronRoster = async (cronId: string) => {
+    const fire = (await built.crons.listFires(cronId)).runs.at(-1);
+    assert.ok(fire);
+    const run = (await built.runs.list()).find(
+      (candidate) => candidate.request.conversation.threadRef === fire.threadRef,
+    );
+    assert.ok(run);
+    return { fire, participants: new Set(run.request.sessionParticipantIds) };
+  };
+  await runNowSettled(built.scheduler, ownerCron.id);
+  const linkedCron = await cronRoster(ownerCron.id);
+  assert.equal(linkedCron.fire.status, "ok");
+  assert.deepEqual(linkedCron.participants, new Set(["owner", "chan-pal"]));
+
+  await built.app.upsertChannels(channels, [{ channelId: "C-ENG", principalId: "owner" }]);
+  assert.equal(await built.projects.membership(groupRef, "chan-pal"), false);
+  assert.equal((await turn("chan-pal", "web:chan-pal:revoked")).status, "refused");
+  assert.equal((await turn("owner", "web:owner:after-revoke")).status, "ok");
+  await assertRoster("web:owner:after-revoke", ["owner"]);
+
+  await runNowSettled(built.scheduler, ownerCron.id);
+  const revokedOwnerCron = await cronRoster(ownerCron.id);
+  assert.equal(revokedOwnerCron.fire.status, "ok");
+  assert.deepEqual(revokedOwnerCron.participants, new Set(["owner"]));
+  await runNowSettled(built.scheduler, inheritedCron.id);
+  assert.equal((await built.crons.get(inheritedCron.id))?.enabled, false);
+
+  await built.app.upsertChannels(channels, [
+    { channelId: "C-ENG", principalId: "owner" },
+    { channelId: "C-ENG", principalId: "chan-gone" },
+  ]);
+  assert.equal(await built.projects.membership(groupRef, "chan-gone"), true);
+  const inactiveCron = await built.app.createCron({
+    ownerScopeId: project.scopeId,
+    owner: "chan-gone",
+    createdBy: "chan-gone",
+    action: "inactive member work",
+    schedule: { everyMs: 60_000 },
+    runAs: "scopeShared",
+    members: [
+      { id: "owner", type: "internal" },
+      { id: "chan-gone", type: "internal" },
+    ],
+  });
+  await built.identity.deactivate("chan-gone");
+  assert.equal(await built.projects.membership(groupRef, "chan-gone"), false);
+  assert.equal((await turn("chan-gone", "web:chan-gone:inactive")).status, "refused");
+  assert.equal((await turn("owner", "web:owner:after-inactive")).status, "ok");
+  await assertRoster("web:owner:after-inactive", ["owner"]);
+
+  await runNowSettled(built.scheduler, ownerCron.id);
+  const inactiveOwnerCron = await cronRoster(ownerCron.id);
+  assert.equal(inactiveOwnerCron.fire.status, "ok");
+  assert.deepEqual(inactiveOwnerCron.participants, new Set(["owner"]));
+  await runNowSettled(built.scheduler, inactiveCron.id);
+  assert.equal((await built.crons.get(inactiveCron.id))?.enabled, false);
 });

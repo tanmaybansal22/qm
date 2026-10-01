@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage } from "node:http";
 import type { AddressInfo } from "node:net";
-import { spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { deriveKey, seal, openSession, type SessionClaims } from "../src/session.ts";
 
 const claimed = new Set<string>();
@@ -42,6 +42,8 @@ process.env.ADMIN_UPSTREAM = upstreamUrl;
 process.env.CORE_API_URL = upstreamUrl;
 process.env.PORTAL_PLAYGROUND = "1";
 process.env.PORTAL_PLAYGROUND_MINTS_PER_IP = "3";
+const SESSION_TTL_S = 28800;
+process.env.PORTAL_SESSION_TTL_S = String(SESSION_TTL_S);
 delete process.env.PORTAL_LOCAL_AUTH_BYPASS;
 
 const { server, mintBucketOf } = await import("../src/index.ts");
@@ -108,9 +110,9 @@ test("sliding renewal preserves the anon flag", async () => {
     org: process.env.CORE_ORG_ID ?? "acme",
     name: "Guest",
     anon: true,
-    auth: now - 15000,
-    iat: now - 15000,
-    exp: now + 13800,
+    auth: now - SESSION_TTL_S / 2 - 600,
+    iat: now - SESSION_TTL_S / 2 - 600,
+    exp: now + SESSION_TTL_S / 2 - 600,
   };
   const res = await fetch(`${base}/`, {
     headers: { ...HTML, cookie: `portal_session=${encodeURIComponent(seal(aged, key))}` },
@@ -149,7 +151,7 @@ test("mintBucketOf keys IPv4 per address and IPv6 per /64", () => {
   assert.equal(mintBucketOf("fe80::1%en0"), "fe80:0:0:0::/64");
 });
 
-test("boot refuses playground configurations that leak or brick", () => {
+test("boot refuses playground configurations that leak or brick", async () => {
   const command = "import('./src/index.ts').then(m => m.bootChecks())";
   const baseEnv: NodeJS.ProcessEnv = {
     ...process.env,
@@ -159,26 +161,36 @@ test("boot refuses playground configurations that leak or brick", () => {
   };
   delete baseEnv.PORTAL_COOKIE_DOMAIN;
   delete baseEnv.PORTAL_APPS_DOMAIN;
+  delete baseEnv.DEPLOY_APPS_DOMAIN;
   delete baseEnv.PORTAL_DEPLOYMENTS_ENABLED;
   delete baseEnv.PORTAL_PLAYGROUND_MINTS_PER_IP;
   delete baseEnv.PORTAL_PLAYGROUND_MINT_WINDOW_S;
   const boot = (env: NodeJS.ProcessEnv) =>
-    spawnSync(process.execPath, ["--input-type=module", "-e", command], { cwd: process.cwd(), env, encoding: "utf8" });
-  assert.equal(boot(baseEnv).status, 0);
+    new Promise<{ status: number | null; stderr: string }>((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", command], { cwd: process.cwd(), env });
+      let stderr = "";
+      child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
+      child.on("error", reject).on("close", (status) => resolve({ status, stderr }));
+    });
   const bad: Array<[NodeJS.ProcessEnv, RegExp]> = [
     [{ PORTAL_PLAYGROUND_MINTS_PER_IP: "0" }, /between 1 and 64/],
     [{ PORTAL_PLAYGROUND_MINTS_PER_IP: "65" }, /between 1 and 64/],
     [{ PORTAL_PLAYGROUND_MINTS_PER_IP: "lots" }, /between 1 and 64/],
     [{ PORTAL_PLAYGROUND_MINT_WINDOW_S: "30" }, /between 60 and 86400/],
     [{ PORTAL_PLAYGROUND_MINT_WINDOW_S: "172800" }, /between 60 and 86400/],
-    [{ PORTAL_COOKIE_DOMAIN: "qm.example.com" }, /PORTAL_COOKIE_DOMAIN and PORTAL_APPS_DOMAIN unset/],
+    [{ PORTAL_COOKIE_DOMAIN: "qm.example.com" }, /the apps domain \(PORTAL_APPS_DOMAIN \/ DEPLOY_APPS_DOMAIN\) unset/],
+    [
+      { DEPLOY_APPS_DOMAIN: "apps.qm.example.com" },
+      /the apps domain \(PORTAL_APPS_DOMAIN \/ DEPLOY_APPS_DOMAIN\) unset/,
+    ],
     [{ PORTAL_DEPLOYMENTS_ENABLED: "1" }, /PORTAL_DEPLOYMENTS_ENABLED unset/],
   ];
-  for (const [extra, pattern] of bad) {
-    const r = boot({ ...baseEnv, ...extra });
-    assert.notEqual(r.status, 0, `expected boot failure for ${JSON.stringify(extra)}`);
-    assert.match(r.stderr, pattern);
-  }
+  const [ok, ...refused] = await Promise.all([baseEnv, ...bad.map(([extra]) => ({ ...baseEnv, ...extra }))].map(boot));
+  assert.equal(ok!.status, 0);
+  bad.forEach(([extra, pattern], i) => {
+    assert.notEqual(refused[i]!.status, 0, `expected boot failure for ${JSON.stringify(extra)}`);
+    assert.match(refused[i]!.stderr, pattern);
+  });
 });
 
 test("mints beyond the per-IP budget are refused, and refusal sets no cookie", async () => {
